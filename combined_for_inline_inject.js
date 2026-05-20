@@ -1,23 +1,16 @@
-/* combined_for_inline_inject.js — hand-scraper-postflop-flop-turn v15
+/* combined_for_inline_inject.js — hand-scraper-postflop-flop-turn v17
  *
- * Concatenation of:
- *   1. multi_street_walker.js   (window.__W)
- *   2. scrape_helpers.js        (window.__msHelpers)
- *   3. scrape_multistreet.js    (window.__scrapeMultiStreet)
- *   4. scrape_resume.js         (window.__scrapeResume + probe)
- *   5. post_reload_wizard.js    (window.__buildPostReloadResumeCfg)
- *
- * Bootstrap from a fresh trainer tab:
- *   await fetch('https://cdn.jsdelivr.net/gh/<USER>/<REPO>@v15/combined_for_inline_inject.js')
- *     .then(r => r.text()).then(src => (0, eval)(src));
- *
- * v15 highlights:
- *   - Random 3-5s wait between every walked node (DFS).
- *   - Turn-chunk zip emitted every 5 walked turn cards (configurable).
- *   - After every emitted zip the orchestrator pauses + checkpoints to
- *     localStorage; user calls window.__msContinue() to resume.
+ * Layout:
+ *   1) multi_street_walker.js (v15)
+ *   2) scrape_helpers.js (v15)
+ *   3) scrape_multistreet.js (v17 — skip_flop_walk, emit_resume_file,
+ *      chunk_max_raw_bytes, terminalFullyDone bug fix)
+ *   4) scrape_resume.js (v15)
+ *   5) post_reload_wizard.js (v15)
+ *   6) combined_v17_extension.js (capsule helpers + __msEmitResumeFile)
  */
 
+/* ==================== 1) WALKER ==================== */
 /* multi_street_walker.js - DOM-only walker for the PLO Master Mind postflop trainer.
  *
  * Installs window.__W with primitives for DFS, modal handling, alias-aware card
@@ -600,7 +593,7 @@
   return 'multi-street walker installed (window.__W) [v15 random 3-5s inter-node wait; v13 plomm envelope support; v11 dynamic bet sizings + 1/5 pot static]';
 })();
 
-
+/* ==================== 2) HELPERS ==================== */
 /* scrape_helpers.js - Interceptors, binary blob decoder, per-node CSV+meta
  * processor, and zip writer for the multi-street scraper. Installs
  * window.__msHelpers.
@@ -1260,7 +1253,7 @@
   return 'multi-street helpers installed (window.__msHelpers) [v15 banner-only republish; v14 labelToTypeSize static-map fix; v13 plomm envelope support; v11 dynamic bet sizings]';
 })();
 
-
+/* ==================== 3) ORCHESTRATOR v17 ==================== */
 /* scrape_multistreet.js - flop+turn tree scraper for the PLO Master Mind
  * postflop trainer. Walks (flop -> every canonical turn under every flop
  * terminal), captures /range/url envelopes, decodes binary/plomm blobs,
@@ -1268,6 +1261,18 @@
  * (default N=5).
  *
  * Requires window.__W (walker) and window.__msHelpers to be installed first.
+ *
+ * v17 CHANGES — genuine flop-walk skip + auto resume.json + byte-threshold + bug fix
+ *   - cfg.skip_flop_walk + cfg.cached_flop_terminals: bypass the flop DFS on
+ *     resume. The resume.json file (auto-emitted alongside every zip) carries
+ *     the terminal structure forward across tabs/chats.
+ *   - cfg.emit_resume_file (default true): trigger a JSON download alongside
+ *     every zip, containing a full v1 capsule + cached_flop_terminals.
+ *   - cfg.chunk_max_raw_bytes (default Infinity): OR trigger alongside
+ *     turn_cards_per_chunk. Whichever fires first emits the chunk.
+ *   - BUG FIX: completedTerminals only populated when the cell loop exits
+ *     naturally (no more cells). Abort/quota/safety-overflow/turn_card_limit
+ *     no longer mark interrupted terminals as fully done.
  *
  * v15 CHANGES — pacing + chunking + pause/checkpoint
  *   - The walker now sleeps a random 3-5 seconds at the START of every
@@ -1540,6 +1545,21 @@
     const turnCardsPerChunk = (typeof cfg.turn_cards_per_chunk === 'number' && cfg.turn_cards_per_chunk > 0) ? cfg.turn_cards_per_chunk : 5;
     // v15: auto-continue defaults to false → orchestrator pauses after each zip.
     const autoContinue = cfg.auto_continue === true;
+    // v17: byte-size OR trigger — flush chunk when raw bytes >= this many,
+    //      OR when card count hits turnCardsPerChunk (whichever fires first).
+    //      Default Infinity (only card count controls; legacy v15 behavior).
+    const chunkMaxRawBytes = (typeof cfg.chunk_max_raw_bytes === 'number' && cfg.chunk_max_raw_bytes > 0) ? cfg.chunk_max_raw_bytes : Infinity;
+    // v17: skip the flop tree walk entirely on resume. Requires
+    //      cfg.cached_flop_terminals to be non-empty (the resume capsule provides
+    //      this). When set, the orchestrator goes directly to the per-terminal
+    //      turn loop without re-walking the flop DFS or re-emitting the flop zip.
+    const skipFlopWalk = cfg.skip_flop_walk === true &&
+      Array.isArray(cfg.cached_flop_terminals) && cfg.cached_flop_terminals.length > 0;
+    // v17: emit a resume.json file alongside every zip download by default.
+    //      Set cfg.emit_resume_file: false to disable. The file is a full v1
+    //      capsule with cached_flop_terminals baked in, so a future resume can
+    //      genuinely skip the flop walk.
+    const emitResumeFile = cfg.emit_resume_file !== false;
 
     window.__msProgress = {
       phase: 'starting', t_start: Date.now(),
@@ -1584,9 +1604,16 @@
     function buildCheckpoint(extra) {
       return {
         scope, chipsPerBb, turn_cards_per_chunk: turnCardsPerChunk,
+        chunk_max_raw_bytes: (chunkMaxRawBytes === Infinity ? null : chunkMaxRawBytes),
         tree: result.tree, flop: result.flop,
         started_at: result.started_at,
         flop_emitted: !!result.flop_zip_emitted_at,
+        // v17: cache the flop terminal structure so a fresh-tab resume can
+        //      pass cfg.skip_flop_walk=true and bypass the flop DFS entirely.
+        cached_flop_terminals: window.__msCachedFlopTerminals
+          ? window.__msCachedFlopTerminals.slice()
+          : null,
+        flop_walk_skipped_on_this_run: !!result.flop_walk_skipped,
         completed_terminals: completedTerminals.slice(),
         next_chunk_index_per_terminal: Object.assign({}, nextChunkIndexPerTerminal),
         completed_cards_per_terminal: Object.fromEntries(
@@ -1609,26 +1636,46 @@
       H.installInterceptors();
       window.__msProgress.phase = 'walking';
 
-      log('phase', { name: 'walk_flop' });
-      await ensureFlopRoot();
-      const flopNodeStartIdx = result.nodes.length;
-      await W.dfsStreet({ node: '', turn: null, river: null, street: 'flop' }, result, {
-        onNodeRecorded: async (state, node) => { node._segment = { kind: 'flop' }; },
-      });
-      await ensureFlopRoot();
-      const flopNodes = result.nodes.slice(flopNodeStartIdx);
-      result.summary.flop_nodes = flopNodes.length;
-      window.__msProgress.nodes_walked = result.nodes.length;
-      log('walk_flop_done', { n: flopNodes.length });
+      // v17: skip the flop walk entirely if the caller provided cached terminals.
+      //      Used by the resume-capsule apply path so a fresh tab doesn't re-walk
+      //      the flop DFS (~10-30s and ~8 quota calls on a typical board).
+      let flopNodes;
+      let captures;
+      if (skipFlopWalk) {
+        log('flop_walk_skipped', {
+          reason: 'cfg.skip_flop_walk=true + cached_flop_terminals provided',
+          n_cached_terminals: cfg.cached_flop_terminals.length,
+        });
+        window.__msProgress.phase = 'flop_walk_skipped';
+        result.flop_walk_skipped = true;
+        flopNodes = []; // empty — no flop scrape work on this run
+        captures = new Map();
+        result.summary.flop_nodes = 0;
+        // Cache the provided terminals on window so buildCheckpoint picks them up.
+        window.__msCachedFlopTerminals = cfg.cached_flop_terminals.slice();
+        result.nodesByKeyShortcut = new Map();
+      } else {
+        log('phase', { name: 'walk_flop' });
+        await ensureFlopRoot();
+        const flopNodeStartIdx = result.nodes.length;
+        await W.dfsStreet({ node: '', turn: null, river: null, street: 'flop' }, result, {
+          onNodeRecorded: async (state, node) => { node._segment = { kind: 'flop' }; },
+        });
+        await ensureFlopRoot();
+        flopNodes = result.nodes.slice(flopNodeStartIdx);
+        result.summary.flop_nodes = flopNodes.length;
+        window.__msProgress.nodes_walked = result.nodes.length;
+        log('walk_flop_done', { n: flopNodes.length });
 
-      await sleep(500);
-      let captures = H.enumerateCaptures(result);
-      log('captures_enumerated', { phase: 'flop', n_captures: captures.size });
+        await sleep(500);
+        captures = H.enumerateCaptures(result);
+        log('captures_enumerated', { phase: 'flop', n_captures: captures.size });
 
-      result.nodesByKeyShortcut = new Map();
-      for (const n of result.nodes) result.nodesByKeyShortcut.set(n.key, n);
+        result.nodesByKeyShortcut = new Map();
+        for (const n of result.nodes) result.nodesByKeyShortcut.set(n.key, n);
+      }
 
-      if (!dryRun) {
+      if (!dryRun && !skipFlopWalk) {
         window.__msProgress.phase = 'scraping_flop';
         const flopZipName = `${result.tree}_${result.flop}_flop.zip`;
         const flopSeg = await processSegment('flop', flopNodes, captures, result, chipsPerBb, {});
@@ -1668,9 +1715,29 @@
             result.flop_zip_emitted_at = new Date().toISOString();
           }
           log('flop_zip_emitted', { name: flopZipName, files: zipEntry?.files });
+          // v17: emit resume.json alongside the flop zip
+          if (emitResumeFile && typeof window.__msEmitResumeFile === 'function') {
+            try {
+              await window.__msEmitResumeFile('after_flop_zip', downloadDelayMs);
+            } catch (e) {
+              result.warnings.push(`emit_resume_file (after_flop_zip) failed: ${e.message}`);
+            }
+          }
           // v15: checkpoint + pause after flop zip.
           saveCheckpoint(buildCheckpoint({ last_event: 'flop_zip_emitted', last_zip: flopZipName }));
           if (!autoContinue) await pauseUntilContinue(`flop zip emitted (${flopZipName})`);
+        }
+      }
+      if (skipFlopWalk) {
+        // No flop zip emitted this run; still save a checkpoint snapshot so the
+        // resume.json reflects "we resumed and skipped the flop walk".
+        saveCheckpoint(buildCheckpoint({ last_event: 'flop_walk_skipped_on_resume' }));
+        if (emitResumeFile && typeof window.__msEmitResumeFile === 'function') {
+          try {
+            await window.__msEmitResumeFile('after_flop_walk_skipped', downloadDelayMs);
+          } catch (e) {
+            result.warnings.push(`emit_resume_file (after_flop_walk_skipped) failed: ${e.message}`);
+          }
         }
       }
 
@@ -1702,10 +1769,22 @@
         return result;
       }
 
-      let flopTerminals = identifyTerminals(flopNodes, 'flop');
+      let flopTerminals;
+      if (skipFlopWalk) {
+        // v17: use the cached terminals provided in cfg (from the resume capsule).
+        flopTerminals = cfg.cached_flop_terminals.slice();
+        log('flop_terminals_from_cache', { n: flopTerminals.length, list: flopTerminals.map(t => t.terminal_node) });
+      } else {
+        flopTerminals = identifyTerminals(flopNodes, 'flop');
+      }
       if (cfg.flop_terminal_filter) flopTerminals = flopTerminals.filter(t => cfg.flop_terminal_filter(t.terminal_node));
+      // v17: cache the terminal structure on window so buildCheckpoint can include
+      //      it in the resume.json, enabling skip_flop_walk on future resumes.
+      window.__msCachedFlopTerminals = flopTerminals.map(t => ({
+        parent: t.parent, terminal_node: t.terminal_node, via: t.via, code: t.code,
+      }));
       result.summary.flop_terminals = flopTerminals.length;
-      log('flop_terminals_identified', { n: flopTerminals.length, list: flopTerminals.map(t => t.terminal_node) });
+      log('flop_terminals_identified', { n: flopTerminals.length, list: flopTerminals.map(t => t.terminal_node), from_cache: !!skipFlopWalk });
 
       for (const ft of flopTerminals) {
         if (window.__msQuotaExceeded || window.__msAborted) {
@@ -1810,6 +1889,15 @@
           chunkState.contents = [];
           // v15: checkpoint + pause after each chunk zip.
           saveCheckpoint(buildCheckpoint({ last_event: 'turn_chunk_emitted', last_zip: chunkZipName, last_terminal: ft.terminal_node }));
+          // v17: emit resume.json alongside the chunk zip
+          if (emitResumeFile && typeof window.__msEmitResumeFile === 'function') {
+            try {
+              const safeFt = ft.terminal_node.replace(/[^A-Za-z0-9_-]/g, '_');
+              await window.__msEmitResumeFile(`after_${safeFt}_chunk${idxStr}`, downloadDelayMs);
+            } catch (e) {
+              result.warnings.push(`emit_resume_file (chunk ${chunkZipName}) failed: ${e.message}`);
+            }
+          }
           if (!autoContinue) await pauseUntilContinue(`turn chunk emitted (${chunkZipName})`);
           return zipEntry;
         }
@@ -1819,6 +1907,11 @@
         const CELL_SAFETY_MAX = 80;
         let zeroWalkCount = 0;
         let zeroWalkRunStreak = 0;
+        // v17: only push to completedTerminals when the cell loop exits naturally
+        //      because no more cells remain. Abort / quota / safety overflow /
+        //      turnCardLimit / break-from-handleOneCell all leave this false.
+        let terminalFullyDone = false;
+        let terminalExitReason = 'unknown';
 
         async function ensureTurnModalAtTerminal() {
           if (W.modalKind() === 'turn' && W.urlNode() === ft.terminal_node && !W.urlSuitMap()) {
@@ -2039,8 +2132,11 @@
             for (const w of turnCardWarnings) result.warnings.push(`[${ft.terminal_node}/${commit.committed}] ${w}`);
 
             // v15: flush on turn-card-count threshold (default 5).
+            // v17: also flush on raw-bytes threshold (default Infinity), whichever first.
             if (chunkState.contents.length >= turnCardsPerChunk) {
               await flushChunk('turn_card_count_threshold');
+            } else if (chunkState.rawBytes >= chunkMaxRawBytes) {
+              await flushChunk('chunk_max_raw_bytes_threshold');
             }
           }
 
@@ -2057,10 +2153,11 @@
         outer:
         while (cellSafety++ < CELL_SAFETY_MAX) {
           if (window.__msQuotaExceeded || window.__msAborted) {
+            terminalExitReason = window.__msQuotaExceeded ? 'quota_exceeded' : 'user_abort';
             log('quota_or_user_abort', { phase: 'cell_loop', terminal: ft.terminal_node });
             break;
           }
-          if (canonicalsWalkedThisTerminal >= turnCardLimit) break;
+          if (canonicalsWalkedThisTerminal >= turnCardLimit) { terminalExitReason = 'turn_card_limit'; break; }
           if (W.modalKind() !== 'turn') {
             const er = await ensureTurnModalAtTerminal();
             if (!er.ok) {
@@ -2093,6 +2190,8 @@
             break;
           }
           if (!target) {
+            terminalFullyDone = true;
+            terminalExitReason = 'no_more_cells';
             break outer;
           }
           visitedThisTerminal.add(target.card);
@@ -2109,15 +2208,35 @@
         if (chunkState.files.length > 0) {
           await flushChunk('terminal_boundary');
         }
-        completedTerminals.push(ft.terminal_node);
-        log('flop_terminal_done', {
-          terminal: ft.terminal_node,
-          chunks_emitted: chunkState.n_emitted,
-        });
-        // v15: refresh checkpoint at terminal boundary (no extra pause —
-        // pause already fired when the boundary chunk was emitted, OR there
-        // was nothing to emit and we just mark the terminal done.)
-        saveCheckpoint(buildCheckpoint({ last_event: 'terminal_done', last_terminal: ft.terminal_node }));
+        // v17 BUG FIX: only mark the terminal fully done when the cell loop
+        //              exited because there were no more cells to walk. An
+        //              abort / quota / safety overflow / turn_card_limit
+        //              exit leaves work incomplete and MUST NOT mark the
+        //              terminal as done (otherwise resume skips it).
+        if (terminalFullyDone) {
+          completedTerminals.push(ft.terminal_node);
+          log('flop_terminal_done', {
+            terminal: ft.terminal_node,
+            chunks_emitted: chunkState.n_emitted,
+            exit_reason: terminalExitReason,
+          });
+          // v15: refresh checkpoint at terminal boundary (no extra pause —
+          // pause already fired when the boundary chunk was emitted, OR there
+          // was nothing to emit and we just mark the terminal done.)
+          saveCheckpoint(buildCheckpoint({ last_event: 'terminal_done', last_terminal: ft.terminal_node }));
+        } else {
+          log('flop_terminal_interrupted', {
+            terminal: ft.terminal_node,
+            chunks_emitted: chunkState.n_emitted,
+            exit_reason: terminalExitReason,
+            canonicals_walked: canonicalsWalkedThisTerminal,
+          });
+          saveCheckpoint(buildCheckpoint({
+            last_event: 'terminal_interrupted',
+            last_terminal: ft.terminal_node,
+            terminal_exit_reason: terminalExitReason,
+          }));
+        }
       }
 
       delete result.nodesByKeyShortcut;
@@ -2146,10 +2265,10 @@
     }
   };
 
-  return 'multi-street scraper installed (window.__scrapeMultiStreet) [v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
+  return 'multi-street scraper installed (window.__scrapeMultiStreet) [v17 skip_flop_walk + cached_flop_terminals + emit_resume_file + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
 })();
 
-
+/* ==================== 4) RESUME ==================== */
 /* scrape_resume.js - resume orchestrator for partially completed flop+turn runs.
  *
  * Installs window.__scrapeResume on top of window.__W + window.__msHelpers.
@@ -2959,7 +3078,7 @@
   return 'resume orchestrator installed (window.__scrapeResume + window.__scrapeResumeProbeQuota) [v15 5-card chunk threshold + pause/checkpoint; 3-5s inter-node wait via walker]';
 })();
 
-
+/* ==================== 5) POST-RELOAD WIZARD ==================== */
 /* post_reload_wizard.js - helpers for building a fresh-run cfg that mimics
  * resume semantics after a tab reload wiped __scrapeResume's prerequisites.
  *
@@ -3156,4 +3275,339 @@
   };
 
   console.log('post-reload wizard installed (window.__buildPostReloadResumeCfg, window.__describeFlopTurnCardOrder) [v15 banner-only republish]');
+})();
+
+/* ==================== 6) V17 CAPSULE EXTENSION ==================== */
+/* combined_v17_extension.js — hand-scraper-postflop-flop-turn v17
+ *
+ * ADDITIVE extension on top of the v17 orchestrator. Installs:
+ *
+ *   window.__msDumpResumeCapsule(opts?)
+ *     Returns a JSON string capsule containing EVERYTHING needed for a
+ *     fresh tab / fresh chat / fresh Cowork session to resume this scrape
+ *     exactly where it left off. v17 additions vs v16:
+ *       - cached_flop_terminals  (so resume can set skip_flop_walk=true)
+ *       - chunk_max_raw_bytes from checkpoint
+ *
+ *   window.__msApplyResumeCapsule(capsuleJsonOrObj)
+ *     Restores localStorage checkpoint, pre-seeds the cross-terminal
+ *     alias / dim caches, AND populates cfg.skip_flop_walk +
+ *     cfg.cached_flop_terminals so the next __scrapeMultiStreet call
+ *     genuinely skips the flop DFS.
+ *
+ *   window.__msEmitResumeFile(eventLabel, downloadDelayMs)
+ *     Builds a capsule and triggers a browser download of
+ *     `<tree>_<flop>_resume_<eventLabel>.json`. Called automatically
+ *     by the v17 orchestrator after every zip emit. Can also be called
+ *     manually from DevTools at any time.
+ *
+ * Also wraps __scrapeMultiStreet (and __scrapeResume if present) to
+ * capture launch cfg + URL on window.__msLaunchCfg / window.__msLaunchUrl.
+ *
+ * The capsule format is intentionally a single JSON object that
+ * round-trips through JSON.parse without loss, so it can be relayed
+ * verbatim through chat.
+ */
+(function installV17CapsuleExtension() {
+  if (typeof window.__scrapeMultiStreet !== 'function') {
+    throw new Error(
+      'v17 extension requires the v17 orchestrator first. Bootstrap the ' +
+      'v17 combined bundle before applying this patch (window.__scrapeMultiStreet missing).'
+    );
+  }
+  if (window.__msV17ExtensionInstalled) {
+    console.warn('[hand-scraper v17] capsule extension already installed; skipping re-install.');
+    return { v17_extension_loaded: true, already: true };
+  }
+
+  const CAPSULE_VERSION = 'v1';
+  const RUNTIME_MIN = 'v17';
+  const CHECKPOINT_KEY = '__msCheckpoint_v15';   // key name preserved for back-compat
+
+  // ---------------------------------------------------------------------
+  // 1) Wrap __scrapeMultiStreet so cfg + URL are captured on launch.
+  // ---------------------------------------------------------------------
+  function serializableCfg(cfg) {
+    if (!cfg || typeof cfg !== 'object') return {};
+    const out = {};
+    for (const [k, v] of Object.entries(cfg)) {
+      if (typeof v === 'function') continue;
+      if (v && typeof v === 'object' && !Array.isArray(v)) {
+        const nested = {};
+        for (const [k2, v2] of Object.entries(v)) {
+          if (typeof v2 === 'function') continue;
+          nested[k2] = v2;
+        }
+        out[k] = nested;
+      } else {
+        out[k] = v;
+      }
+    }
+    return out;
+  }
+
+  const __origScrape = window.__scrapeMultiStreet;
+  window.__scrapeMultiStreet = function(cfg) {
+    cfg = cfg || {};
+    try {
+      window.__msLaunchCfg = serializableCfg(cfg);
+      window.__msLaunchUrl = location.href;
+      window.__msLaunchAt = new Date().toISOString();
+      window.__msLaunchKind = 'fresh';
+    } catch (e) {}
+    return __origScrape.call(this, cfg);
+  };
+  if (typeof window.__scrapeResume === 'function') {
+    const __origResume = window.__scrapeResume;
+    window.__scrapeResume = function(cfg) {
+      cfg = cfg || {};
+      try {
+        window.__msLaunchCfg = serializableCfg(cfg);
+        window.__msLaunchUrl = location.href;
+        window.__msLaunchAt = new Date().toISOString();
+        window.__msLaunchKind = 'resume';
+      } catch (e) {}
+      return __origResume.call(this, cfg);
+    };
+  }
+
+  // ---------------------------------------------------------------------
+  // 2) __msDumpResumeCapsule()
+  // ---------------------------------------------------------------------
+  window.__msDumpResumeCapsule = function(opts) {
+    opts = opts || {};
+    const ckpt = window.__msCheckpoint || (function() {
+      try { return JSON.parse(localStorage.getItem(CHECKPOINT_KEY) || 'null'); }
+      catch (e) { return null; }
+    })();
+    if (!ckpt) {
+      throw new Error('__msDumpResumeCapsule: no checkpoint found in window.__msCheckpoint or localStorage.');
+    }
+    const flop = ckpt.flop;
+    const knownAliases = window.__msCanonCache &&
+      window.__msCanonCache.turnAliasMap &&
+      typeof window.__msCanonCache.turnAliasMap.get === 'function'
+        ? window.__msCanonCache.turnAliasMap.get(flop)
+        : null;
+    const knownDim = window.__msCanonCache &&
+      window.__msCanonCache.turnDimSet &&
+      typeof window.__msCanonCache.turnDimSet.get === 'function'
+        ? window.__msCanonCache.turnDimSet.get(flop)
+        : null;
+
+    // v17: cached_flop_terminals lives on window AND in checkpoint.
+    // Prefer the live window value; fall back to checkpoint.
+    const cachedFlopTerminals = Array.isArray(window.__msCachedFlopTerminals) && window.__msCachedFlopTerminals.length
+      ? window.__msCachedFlopTerminals.slice()
+      : (Array.isArray(ckpt.cached_flop_terminals) ? ckpt.cached_flop_terminals.slice() : null);
+
+    const capsule = {
+      capsule_version: CAPSULE_VERSION,
+      skill_runtime_min_version: RUNTIME_MIN,
+      created_at: new Date().toISOString(),
+      url: window.__msLaunchUrl || location.href,
+      launch_at: window.__msLaunchAt || null,
+      launch_cfg: window.__msLaunchCfg || null,
+      checkpoint: ckpt,
+      cross_terminal_alias_map: knownAliases ? Object.fromEntries(knownAliases) : {},
+      turn_dim_cards: knownDim ? Array.from(knownDim) : [],
+      // v17 new field — enables skip_flop_walk on apply
+      cached_flop_terminals: cachedFlopTerminals,
+      summary: {
+        tree: ckpt.tree,
+        flop: ckpt.flop,
+        chipsPerBb: ckpt.chipsPerBb,
+        turn_cards_per_chunk: ckpt.turn_cards_per_chunk,
+        chunk_max_raw_bytes: ckpt.chunk_max_raw_bytes,
+        flop_emitted: !!ckpt.flop_emitted,
+        flop_walk_skipped_on_this_run: !!ckpt.flop_walk_skipped_on_this_run,
+        flop_terminals_cached: cachedFlopTerminals ? cachedFlopTerminals.map(t => t.terminal_node) : [],
+        completed_terminals: (ckpt.completed_terminals || []).slice(),
+        completed_cards_per_terminal: Object.fromEntries(
+          Object.entries(ckpt.completed_cards_per_terminal || {}).map(([k, v]) => [k, v.slice()])
+        ),
+        next_chunk_index_per_terminal: Object.assign({}, ckpt.next_chunk_index_per_terminal || {}),
+        zips_emitted: (ckpt.zips_emitted || []).map(z => z.name),
+        last_event: ckpt.extra && ckpt.extra.last_event,
+        terminal_exit_reason: ckpt.extra && ckpt.extra.terminal_exit_reason,
+      },
+    };
+    const pretty = opts.compact === true
+      ? JSON.stringify(capsule)
+      : JSON.stringify(capsule, null, 2);
+    if (opts.silent !== true) {
+      try {
+        console.log('=== HAND-SCRAPER RESUME CAPSULE v1 BEGIN ===');
+        console.log(pretty);
+        console.log('=== HAND-SCRAPER RESUME CAPSULE v1 END ===');
+      } catch (_) {}
+    }
+    return pretty;
+  };
+
+  // ---------------------------------------------------------------------
+  // 3) __msEmitResumeFile(eventLabel, downloadDelayMs)
+  //    Triggers a browser download of a JSON file named
+  //    <tree>_<flop>_resume_<eventLabel>.json containing the current capsule.
+  //    Called automatically by the v17 orchestrator after every zip emit.
+  // ---------------------------------------------------------------------
+  window.__msEmitResumeFile = async function(eventLabel, downloadDelayMs) {
+    eventLabel = eventLabel || 'manual';
+    const safeLabel = String(eventLabel).replace(/[^A-Za-z0-9_-]/g, '_');
+    downloadDelayMs = (typeof downloadDelayMs === 'number') ? downloadDelayMs : 250;
+
+    const capsuleStr = window.__msDumpResumeCapsule({ silent: true });
+    const capsule = JSON.parse(capsuleStr);
+    const tree = (capsule.checkpoint && capsule.checkpoint.tree) || 'UNKNOWN_TREE';
+    const flop = (capsule.checkpoint && capsule.checkpoint.flop) || 'UNKNOWN_FLOP';
+    const fileName = `${tree}_${flop}_resume_${safeLabel}.json`;
+
+    try {
+      const blob = new Blob([capsuleStr], { type: 'application/json' });
+      const dlUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = dlUrl;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => { a.remove(); URL.revokeObjectURL(dlUrl); }, 1000);
+    } catch (e) {
+      console.warn('[hand-scraper v17] __msEmitResumeFile: download failed:', e && e.message);
+      throw e;
+    }
+
+    // Track the emitted resume files on a registry, like __msAllZips.
+    if (!Array.isArray(window.__msAllResumeFiles)) window.__msAllResumeFiles = [];
+    window.__msAllResumeFiles.push({
+      name: fileName,
+      bytes: capsuleStr.length,
+      event: eventLabel,
+      t: Date.now(),
+    });
+
+    if (downloadDelayMs > 0) {
+      await new Promise(r => setTimeout(r, downloadDelayMs));
+    }
+    return { name: fileName, bytes: capsuleStr.length };
+  };
+
+  // ---------------------------------------------------------------------
+  // 4) __msApplyResumeCapsule(capsuleJsonOrObj)
+  // ---------------------------------------------------------------------
+  window.__msApplyResumeCapsule = function(capsule) {
+    if (typeof window.__buildPostReloadResumeCfg !== 'function') {
+      throw new Error('__msApplyResumeCapsule: requires post-reload wizard. Bootstrap the v17 bundle first.');
+    }
+    if (typeof capsule === 'string') {
+      let s = capsule;
+      const beginMark = '=== HAND-SCRAPER RESUME CAPSULE v1 BEGIN ===';
+      const endMark   = '=== HAND-SCRAPER RESUME CAPSULE v1 END ===';
+      const b = s.indexOf(beginMark);
+      if (b !== -1) s = s.slice(b + beginMark.length);
+      const e = s.indexOf(endMark);
+      if (e !== -1) s = s.slice(0, e);
+      s = s.trim();
+      if (!s.startsWith('{')) {
+        const braceIdx = s.indexOf('{');
+        if (braceIdx !== -1) s = s.slice(braceIdx);
+      }
+      try { capsule = JSON.parse(s); }
+      catch (err) {
+        throw new Error('Capsule JSON parse failed: ' + err.message);
+      }
+    }
+    if (!capsule || typeof capsule !== 'object' || !capsule.capsule_version) {
+      throw new Error('__msApplyResumeCapsule: input does not look like a v1 capsule (missing capsule_version).');
+    }
+    const ckpt = capsule.checkpoint;
+    if (!ckpt || !ckpt.flop || !ckpt.tree) {
+      throw new Error('__msApplyResumeCapsule: capsule.checkpoint missing required tree/flop fields.');
+    }
+
+    // 1) Restore localStorage checkpoint
+    try { localStorage.setItem(CHECKPOINT_KEY, JSON.stringify(ckpt)); }
+    catch (e) { console.warn('[hand-scraper v17] could not write checkpoint to localStorage:', e && e.message); }
+    window.__msCheckpoint = ckpt;
+
+    // 2) Seed cross-terminal alias + dim caches for this flop
+    if (!window.__msCanonCache) window.__msCanonCache = { turn: new Map(), river: new Map() };
+    if (!window.__msCanonCache.turnAliasMap) window.__msCanonCache.turnAliasMap = new Map();
+    if (!window.__msCanonCache.turnDimSet)   window.__msCanonCache.turnDimSet   = new Map();
+    window.__msCanonCache.turnAliasMap.set(
+      ckpt.flop,
+      new Map(Object.entries(capsule.cross_terminal_alias_map || {}))
+    );
+    window.__msCanonCache.turnDimSet.set(
+      ckpt.flop,
+      new Set(capsule.turn_dim_cards || [])
+    );
+
+    // 3) Pre-seed window.__msCachedFlopTerminals so the orchestrator can use it
+    //    even if the caller doesn't pass it through cfg explicitly.
+    const cachedFlopTerminals = Array.isArray(capsule.cached_flop_terminals) && capsule.cached_flop_terminals.length
+      ? capsule.cached_flop_terminals.slice()
+      : (Array.isArray(ckpt.cached_flop_terminals) ? ckpt.cached_flop_terminals.slice() : null);
+    if (cachedFlopTerminals) window.__msCachedFlopTerminals = cachedFlopTerminals;
+
+    // 4) Build the wizard spec from checkpoint state
+    const spec = {
+      flop: ckpt.flop,
+      flop_zip_already_on_disk: !!ckpt.flop_emitted,
+      per_terminal: {},
+    };
+    for (const term of (ckpt.completed_terminals || [])) {
+      spec.per_terminal[term] = { kind: 'fully_done' };
+    }
+    for (const [term, doneCards] of Object.entries(ckpt.completed_cards_per_terminal || {})) {
+      if (spec.per_terminal[term]) continue;
+      if (!Array.isArray(doneCards) || doneCards.length === 0) continue;
+      const nextChunk = (ckpt.next_chunk_index_per_terminal || {})[term] || 1;
+      spec.per_terminal[term] = {
+        kind: 'partial',
+        skip_cards: doneCards.slice(),
+        prior_chunks_emitted: Math.max(0, nextChunk - 1),
+      };
+    }
+
+    // 5) Call the wizard
+    const wiz = window.__buildPostReloadResumeCfg(spec);
+
+    // 6) v17: enable skip_flop_walk if we have cached terminals
+    if (cachedFlopTerminals) {
+      wiz.cfg.skip_flop_walk = true;
+      wiz.cfg.cached_flop_terminals = cachedFlopTerminals;
+      wiz.trace.push(`v17: cfg.skip_flop_walk=true with ${cachedFlopTerminals.length} cached terminals — flop DFS will be bypassed entirely`);
+    } else {
+      wiz.trace.push('v17: no cached_flop_terminals in capsule → flop walk will run again (~30s + ~8 quota calls)');
+    }
+
+    // 7) Merge runtime knobs from the launch cfg
+    const lcfg = capsule.launch_cfg || {};
+    if (typeof lcfg.chipsPerBb === 'number')           wiz.cfg.chipsPerBb           = lcfg.chipsPerBb;
+    if (typeof lcfg.turn_cards_per_chunk === 'number') wiz.cfg.turn_cards_per_chunk = lcfg.turn_cards_per_chunk;
+    if (typeof lcfg.chunk_max_raw_bytes === 'number')  wiz.cfg.chunk_max_raw_bytes  = lcfg.chunk_max_raw_bytes;
+    if (typeof lcfg.node_wait_min_ms === 'number')     wiz.cfg.node_wait_min_ms     = lcfg.node_wait_min_ms;
+    if (typeof lcfg.node_wait_max_ms === 'number')     wiz.cfg.node_wait_max_ms     = lcfg.node_wait_max_ms;
+    if (typeof lcfg.auto_continue === 'boolean')       wiz.cfg.auto_continue        = lcfg.auto_continue;
+    if (typeof lcfg.download_delay_ms === 'number')    wiz.cfg.download_delay_ms    = lcfg.download_delay_ms;
+    if (typeof lcfg.emit_resume_file === 'boolean')    wiz.cfg.emit_resume_file     = lcfg.emit_resume_file;
+
+    return {
+      cfg: wiz.cfg,
+      trace: wiz.trace,
+      warnings: wiz.warnings,
+      expected_url: capsule.url,
+      current_url: location.href,
+      url_matches: (location.href.indexOf(ckpt.flop) !== -1 && location.href.indexOf(ckpt.tree) !== -1),
+      flop_walk_will_skip: !!wiz.cfg.skip_flop_walk,
+      spec_used: spec,
+      summary_from_capsule: capsule.summary || null,
+    };
+  };
+
+  window.__msV17ExtensionInstalled = true;
+  try {
+    console.log('[hand-scraper v17] capsule extension installed (__msDumpResumeCapsule, __msApplyResumeCapsule, __msEmitResumeFile). Pauses still come from v15; Claude must NEVER auto-continue them.');
+  } catch (_) {}
+  return { v17_extension_loaded: true };
 })();

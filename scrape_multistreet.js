@@ -6,6 +6,18 @@
  *
  * Requires window.__W (walker) and window.__msHelpers to be installed first.
  *
+ * v17 CHANGES — genuine flop-walk skip + auto resume.json + byte-threshold + bug fix
+ *   - cfg.skip_flop_walk + cfg.cached_flop_terminals: bypass the flop DFS on
+ *     resume. The resume.json file (auto-emitted alongside every zip) carries
+ *     the terminal structure forward across tabs/chats.
+ *   - cfg.emit_resume_file (default true): trigger a JSON download alongside
+ *     every zip, containing a full v1 capsule + cached_flop_terminals.
+ *   - cfg.chunk_max_raw_bytes (default Infinity): OR trigger alongside
+ *     turn_cards_per_chunk. Whichever fires first emits the chunk.
+ *   - BUG FIX: completedTerminals only populated when the cell loop exits
+ *     naturally (no more cells). Abort/quota/safety-overflow/turn_card_limit
+ *     no longer mark interrupted terminals as fully done.
+ *
  * v15 CHANGES — pacing + chunking + pause/checkpoint
  *   - The walker now sleeps a random 3-5 seconds at the START of every
  *     node visit (see multi_street_walker.js v15 notes). Configurable via
@@ -277,6 +289,21 @@
     const turnCardsPerChunk = (typeof cfg.turn_cards_per_chunk === 'number' && cfg.turn_cards_per_chunk > 0) ? cfg.turn_cards_per_chunk : 5;
     // v15: auto-continue defaults to false → orchestrator pauses after each zip.
     const autoContinue = cfg.auto_continue === true;
+    // v17: byte-size OR trigger — flush chunk when raw bytes >= this many,
+    //      OR when card count hits turnCardsPerChunk (whichever fires first).
+    //      Default Infinity (only card count controls; legacy v15 behavior).
+    const chunkMaxRawBytes = (typeof cfg.chunk_max_raw_bytes === 'number' && cfg.chunk_max_raw_bytes > 0) ? cfg.chunk_max_raw_bytes : Infinity;
+    // v17: skip the flop tree walk entirely on resume. Requires
+    //      cfg.cached_flop_terminals to be non-empty (the resume capsule provides
+    //      this). When set, the orchestrator goes directly to the per-terminal
+    //      turn loop without re-walking the flop DFS or re-emitting the flop zip.
+    const skipFlopWalk = cfg.skip_flop_walk === true &&
+      Array.isArray(cfg.cached_flop_terminals) && cfg.cached_flop_terminals.length > 0;
+    // v17: emit a resume.json file alongside every zip download by default.
+    //      Set cfg.emit_resume_file: false to disable. The file is a full v1
+    //      capsule with cached_flop_terminals baked in, so a future resume can
+    //      genuinely skip the flop walk.
+    const emitResumeFile = cfg.emit_resume_file !== false;
 
     window.__msProgress = {
       phase: 'starting', t_start: Date.now(),
@@ -321,9 +348,16 @@
     function buildCheckpoint(extra) {
       return {
         scope, chipsPerBb, turn_cards_per_chunk: turnCardsPerChunk,
+        chunk_max_raw_bytes: (chunkMaxRawBytes === Infinity ? null : chunkMaxRawBytes),
         tree: result.tree, flop: result.flop,
         started_at: result.started_at,
         flop_emitted: !!result.flop_zip_emitted_at,
+        // v17: cache the flop terminal structure so a fresh-tab resume can
+        //      pass cfg.skip_flop_walk=true and bypass the flop DFS entirely.
+        cached_flop_terminals: window.__msCachedFlopTerminals
+          ? window.__msCachedFlopTerminals.slice()
+          : null,
+        flop_walk_skipped_on_this_run: !!result.flop_walk_skipped,
         completed_terminals: completedTerminals.slice(),
         next_chunk_index_per_terminal: Object.assign({}, nextChunkIndexPerTerminal),
         completed_cards_per_terminal: Object.fromEntries(
@@ -346,26 +380,46 @@
       H.installInterceptors();
       window.__msProgress.phase = 'walking';
 
-      log('phase', { name: 'walk_flop' });
-      await ensureFlopRoot();
-      const flopNodeStartIdx = result.nodes.length;
-      await W.dfsStreet({ node: '', turn: null, river: null, street: 'flop' }, result, {
-        onNodeRecorded: async (state, node) => { node._segment = { kind: 'flop' }; },
-      });
-      await ensureFlopRoot();
-      const flopNodes = result.nodes.slice(flopNodeStartIdx);
-      result.summary.flop_nodes = flopNodes.length;
-      window.__msProgress.nodes_walked = result.nodes.length;
-      log('walk_flop_done', { n: flopNodes.length });
+      // v17: skip the flop walk entirely if the caller provided cached terminals.
+      //      Used by the resume-capsule apply path so a fresh tab doesn't re-walk
+      //      the flop DFS (~10-30s and ~8 quota calls on a typical board).
+      let flopNodes;
+      let captures;
+      if (skipFlopWalk) {
+        log('flop_walk_skipped', {
+          reason: 'cfg.skip_flop_walk=true + cached_flop_terminals provided',
+          n_cached_terminals: cfg.cached_flop_terminals.length,
+        });
+        window.__msProgress.phase = 'flop_walk_skipped';
+        result.flop_walk_skipped = true;
+        flopNodes = []; // empty — no flop scrape work on this run
+        captures = new Map();
+        result.summary.flop_nodes = 0;
+        // Cache the provided terminals on window so buildCheckpoint picks them up.
+        window.__msCachedFlopTerminals = cfg.cached_flop_terminals.slice();
+        result.nodesByKeyShortcut = new Map();
+      } else {
+        log('phase', { name: 'walk_flop' });
+        await ensureFlopRoot();
+        const flopNodeStartIdx = result.nodes.length;
+        await W.dfsStreet({ node: '', turn: null, river: null, street: 'flop' }, result, {
+          onNodeRecorded: async (state, node) => { node._segment = { kind: 'flop' }; },
+        });
+        await ensureFlopRoot();
+        flopNodes = result.nodes.slice(flopNodeStartIdx);
+        result.summary.flop_nodes = flopNodes.length;
+        window.__msProgress.nodes_walked = result.nodes.length;
+        log('walk_flop_done', { n: flopNodes.length });
 
-      await sleep(500);
-      let captures = H.enumerateCaptures(result);
-      log('captures_enumerated', { phase: 'flop', n_captures: captures.size });
+        await sleep(500);
+        captures = H.enumerateCaptures(result);
+        log('captures_enumerated', { phase: 'flop', n_captures: captures.size });
 
-      result.nodesByKeyShortcut = new Map();
-      for (const n of result.nodes) result.nodesByKeyShortcut.set(n.key, n);
+        result.nodesByKeyShortcut = new Map();
+        for (const n of result.nodes) result.nodesByKeyShortcut.set(n.key, n);
+      }
 
-      if (!dryRun) {
+      if (!dryRun && !skipFlopWalk) {
         window.__msProgress.phase = 'scraping_flop';
         const flopZipName = `${result.tree}_${result.flop}_flop.zip`;
         const flopSeg = await processSegment('flop', flopNodes, captures, result, chipsPerBb, {});
@@ -405,9 +459,29 @@
             result.flop_zip_emitted_at = new Date().toISOString();
           }
           log('flop_zip_emitted', { name: flopZipName, files: zipEntry?.files });
+          // v17: emit resume.json alongside the flop zip
+          if (emitResumeFile && typeof window.__msEmitResumeFile === 'function') {
+            try {
+              await window.__msEmitResumeFile('after_flop_zip', downloadDelayMs);
+            } catch (e) {
+              result.warnings.push(`emit_resume_file (after_flop_zip) failed: ${e.message}`);
+            }
+          }
           // v15: checkpoint + pause after flop zip.
           saveCheckpoint(buildCheckpoint({ last_event: 'flop_zip_emitted', last_zip: flopZipName }));
           if (!autoContinue) await pauseUntilContinue(`flop zip emitted (${flopZipName})`);
+        }
+      }
+      if (skipFlopWalk) {
+        // No flop zip emitted this run; still save a checkpoint snapshot so the
+        // resume.json reflects "we resumed and skipped the flop walk".
+        saveCheckpoint(buildCheckpoint({ last_event: 'flop_walk_skipped_on_resume' }));
+        if (emitResumeFile && typeof window.__msEmitResumeFile === 'function') {
+          try {
+            await window.__msEmitResumeFile('after_flop_walk_skipped', downloadDelayMs);
+          } catch (e) {
+            result.warnings.push(`emit_resume_file (after_flop_walk_skipped) failed: ${e.message}`);
+          }
         }
       }
 
@@ -439,10 +513,22 @@
         return result;
       }
 
-      let flopTerminals = identifyTerminals(flopNodes, 'flop');
+      let flopTerminals;
+      if (skipFlopWalk) {
+        // v17: use the cached terminals provided in cfg (from the resume capsule).
+        flopTerminals = cfg.cached_flop_terminals.slice();
+        log('flop_terminals_from_cache', { n: flopTerminals.length, list: flopTerminals.map(t => t.terminal_node) });
+      } else {
+        flopTerminals = identifyTerminals(flopNodes, 'flop');
+      }
       if (cfg.flop_terminal_filter) flopTerminals = flopTerminals.filter(t => cfg.flop_terminal_filter(t.terminal_node));
+      // v17: cache the terminal structure on window so buildCheckpoint can include
+      //      it in the resume.json, enabling skip_flop_walk on future resumes.
+      window.__msCachedFlopTerminals = flopTerminals.map(t => ({
+        parent: t.parent, terminal_node: t.terminal_node, via: t.via, code: t.code,
+      }));
       result.summary.flop_terminals = flopTerminals.length;
-      log('flop_terminals_identified', { n: flopTerminals.length, list: flopTerminals.map(t => t.terminal_node) });
+      log('flop_terminals_identified', { n: flopTerminals.length, list: flopTerminals.map(t => t.terminal_node), from_cache: !!skipFlopWalk });
 
       for (const ft of flopTerminals) {
         if (window.__msQuotaExceeded || window.__msAborted) {
@@ -547,6 +633,15 @@
           chunkState.contents = [];
           // v15: checkpoint + pause after each chunk zip.
           saveCheckpoint(buildCheckpoint({ last_event: 'turn_chunk_emitted', last_zip: chunkZipName, last_terminal: ft.terminal_node }));
+          // v17: emit resume.json alongside the chunk zip
+          if (emitResumeFile && typeof window.__msEmitResumeFile === 'function') {
+            try {
+              const safeFt = ft.terminal_node.replace(/[^A-Za-z0-9_-]/g, '_');
+              await window.__msEmitResumeFile(`after_${safeFt}_chunk${idxStr}`, downloadDelayMs);
+            } catch (e) {
+              result.warnings.push(`emit_resume_file (chunk ${chunkZipName}) failed: ${e.message}`);
+            }
+          }
           if (!autoContinue) await pauseUntilContinue(`turn chunk emitted (${chunkZipName})`);
           return zipEntry;
         }
@@ -556,6 +651,11 @@
         const CELL_SAFETY_MAX = 80;
         let zeroWalkCount = 0;
         let zeroWalkRunStreak = 0;
+        // v17: only push to completedTerminals when the cell loop exits naturally
+        //      because no more cells remain. Abort / quota / safety overflow /
+        //      turnCardLimit / break-from-handleOneCell all leave this false.
+        let terminalFullyDone = false;
+        let terminalExitReason = 'unknown';
 
         async function ensureTurnModalAtTerminal() {
           if (W.modalKind() === 'turn' && W.urlNode() === ft.terminal_node && !W.urlSuitMap()) {
@@ -776,8 +876,11 @@
             for (const w of turnCardWarnings) result.warnings.push(`[${ft.terminal_node}/${commit.committed}] ${w}`);
 
             // v15: flush on turn-card-count threshold (default 5).
+            // v17: also flush on raw-bytes threshold (default Infinity), whichever first.
             if (chunkState.contents.length >= turnCardsPerChunk) {
               await flushChunk('turn_card_count_threshold');
+            } else if (chunkState.rawBytes >= chunkMaxRawBytes) {
+              await flushChunk('chunk_max_raw_bytes_threshold');
             }
           }
 
@@ -794,10 +897,11 @@
         outer:
         while (cellSafety++ < CELL_SAFETY_MAX) {
           if (window.__msQuotaExceeded || window.__msAborted) {
+            terminalExitReason = window.__msQuotaExceeded ? 'quota_exceeded' : 'user_abort';
             log('quota_or_user_abort', { phase: 'cell_loop', terminal: ft.terminal_node });
             break;
           }
-          if (canonicalsWalkedThisTerminal >= turnCardLimit) break;
+          if (canonicalsWalkedThisTerminal >= turnCardLimit) { terminalExitReason = 'turn_card_limit'; break; }
           if (W.modalKind() !== 'turn') {
             const er = await ensureTurnModalAtTerminal();
             if (!er.ok) {
@@ -830,6 +934,8 @@
             break;
           }
           if (!target) {
+            terminalFullyDone = true;
+            terminalExitReason = 'no_more_cells';
             break outer;
           }
           visitedThisTerminal.add(target.card);
@@ -846,15 +952,35 @@
         if (chunkState.files.length > 0) {
           await flushChunk('terminal_boundary');
         }
-        completedTerminals.push(ft.terminal_node);
-        log('flop_terminal_done', {
-          terminal: ft.terminal_node,
-          chunks_emitted: chunkState.n_emitted,
-        });
-        // v15: refresh checkpoint at terminal boundary (no extra pause —
-        // pause already fired when the boundary chunk was emitted, OR there
-        // was nothing to emit and we just mark the terminal done.)
-        saveCheckpoint(buildCheckpoint({ last_event: 'terminal_done', last_terminal: ft.terminal_node }));
+        // v17 BUG FIX: only mark the terminal fully done when the cell loop
+        //              exited because there were no more cells to walk. An
+        //              abort / quota / safety overflow / turn_card_limit
+        //              exit leaves work incomplete and MUST NOT mark the
+        //              terminal as done (otherwise resume skips it).
+        if (terminalFullyDone) {
+          completedTerminals.push(ft.terminal_node);
+          log('flop_terminal_done', {
+            terminal: ft.terminal_node,
+            chunks_emitted: chunkState.n_emitted,
+            exit_reason: terminalExitReason,
+          });
+          // v15: refresh checkpoint at terminal boundary (no extra pause —
+          // pause already fired when the boundary chunk was emitted, OR there
+          // was nothing to emit and we just mark the terminal done.)
+          saveCheckpoint(buildCheckpoint({ last_event: 'terminal_done', last_terminal: ft.terminal_node }));
+        } else {
+          log('flop_terminal_interrupted', {
+            terminal: ft.terminal_node,
+            chunks_emitted: chunkState.n_emitted,
+            exit_reason: terminalExitReason,
+            canonicals_walked: canonicalsWalkedThisTerminal,
+          });
+          saveCheckpoint(buildCheckpoint({
+            last_event: 'terminal_interrupted',
+            last_terminal: ft.terminal_node,
+            terminal_exit_reason: terminalExitReason,
+          }));
+        }
       }
 
       delete result.nodesByKeyShortcut;
@@ -883,5 +1009,5 @@
     }
   };
 
-  return 'multi-street scraper installed (window.__scrapeMultiStreet) [v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
+  return 'multi-street scraper installed (window.__scrapeMultiStreet) [v17 skip_flop_walk + cached_flop_terminals + emit_resume_file + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
 })();
