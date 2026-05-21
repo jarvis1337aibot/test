@@ -6,6 +6,18 @@
  *
  * Requires window.__W (walker) and window.__msHelpers to be installed first.
  *
+ * POST-v18 CHANGES — checkpoint hygiene bug fixes (2026-05-20)
+ *   - FLOP EMIT ORDER: __msEmitResumeFile('after_flop_zip') now fires AFTER
+ *     saveCheckpoint(), matching the turn-chunk path. Previously the inverted
+ *     order let stale window.__msCheckpoint / localStorage state from a prior
+ *     run leak into the new run's first resume.json (mismatched flop names
+ *     between the freshly-emitted zip and the resume.json checkpoint).
+ *   - FRESH-LAUNCH STATE CLEAR: every non-resume invocation now clears
+ *     window.__msCheckpoint, localStorage __msCheckpoint_v15,
+ *     window.__msCachedFlopTerminals, and window.__msAllResumeFiles at
+ *     startup. Resume invocations (cfg.skip_flop_walk === true) preserve
+ *     prior state because that IS the work being resumed.
+ *
  * v17 CHANGES — genuine flop-walk skip + auto resume.json + byte-threshold + bug fix
  *   - cfg.skip_flop_walk + cfg.cached_flop_terminals: bypass the flop DFS on
  *     resume. The resume.json file (auto-emitted alongside every zip) carries
@@ -323,6 +335,22 @@
     window.__msQuotaExceeded = null;
     window.__msPaused = false;
     window.__msAborted = false;
+    // POST-v18 BUG FIX (checkpoint hygiene): clear stale checkpoint state at
+    //   the start of every fresh (non-resume) launch. Without this, a prior
+    //   run's checkpoint (still on window.__msCheckpoint and/or in
+    //   localStorage under '__msCheckpoint_v15') leaks into the first
+    //   resume.json emitted on the new run -- observable as a flop mismatch
+    //   between the URL / flop_zip filename (new run) and the
+    //   checkpoint.flop / zips_emitted inside the resume.json (old run).
+    //   A resume invocation supplies cfg.skip_flop_walk + cfg.cached_flop_terminals;
+    //   in that case we keep the existing checkpoint because it IS this run's
+    //   prior state being carried forward.
+    if (cfg.skip_flop_walk !== true) {
+      window.__msCheckpoint = null;
+      try { localStorage.removeItem(CHECKPOINT_KEY); } catch (_) {}
+      window.__msCachedFlopTerminals = null;
+      window.__msAllResumeFiles = [];
+    }
     if (typeof H.resetZipCompressionState === 'function') {
       H.resetZipCompressionState();
     }
@@ -459,7 +487,13 @@
             result.flop_zip_emitted_at = new Date().toISOString();
           }
           log('flop_zip_emitted', { name: flopZipName, files: zipEntry?.files });
-          // v17: emit resume.json alongside the flop zip
+          // POST-v18 BUG FIX (flop emit order): checkpoint MUST be saved BEFORE
+          //   __msEmitResumeFile so the resume.json captures this-run state, not
+          //   leftover state from a prior run. The turn-chunk path below was
+          //   already in the correct order; only the flop path was inverted.
+          saveCheckpoint(buildCheckpoint({ last_event: 'flop_zip_emitted', last_zip: flopZipName }));
+          // v17: emit resume.json alongside the flop zip (now reads the
+          //   just-saved checkpoint).
           if (emitResumeFile && typeof window.__msEmitResumeFile === 'function') {
             try {
               await window.__msEmitResumeFile('after_flop_zip', downloadDelayMs);
@@ -467,8 +501,6 @@
               result.warnings.push(`emit_resume_file (after_flop_zip) failed: ${e.message}`);
             }
           }
-          // v15: checkpoint + pause after flop zip.
-          saveCheckpoint(buildCheckpoint({ last_event: 'flop_zip_emitted', last_zip: flopZipName }));
           if (!autoContinue) await pauseUntilContinue(`flop zip emitted (${flopZipName})`);
         }
       }
@@ -1009,6 +1041,7 @@
     }
   };
 
-  return 'multi-street scraper installed (window.__scrapeMultiStreet) [v17 skip_flop_walk + cached_flop_terminals + emit_resume_file + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
+  window.__msCheckpointHygieneFixed = true;
+  return 'multi-street scraper installed (window.__scrapeMultiStreet) [post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + emit_resume_file + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
 })();
 

@@ -1,6 +1,6 @@
-/* combined_v17_extension.js — hand-scraper-postflop-flop-turn v17
+/* combined_v17_extension.js -- hand-scraper-postflop-flop-turn
  *
- * ADDITIVE extension on top of the v17 orchestrator. Installs:
+ * ADDITIVE extension on top of the orchestrator. Installs:
  *
  *   window.__msDumpResumeCapsule(opts?)
  *     Returns a JSON string capsule containing EVERYTHING needed for a
@@ -18,8 +18,15 @@
  *   window.__msEmitResumeFile(eventLabel, downloadDelayMs)
  *     Builds a capsule and triggers a browser download of
  *     `<tree>_<flop>_resume_<eventLabel>.json`. Called automatically
- *     by the v17 orchestrator after every zip emit. Can also be called
+ *     by the orchestrator after every zip emit. Can also be called
  *     manually from DevTools at any time.
+ *
+ *     POST-v18 BUG FIX (2026-05-20): refuses to emit if the checkpoint's
+ *     flop does not match the URL's flop param. This catches the case
+ *     where stale state from a prior run leaks into a fresh launch's
+ *     first resume.json. Throws an Error with code
+ *     MS_RESUME_FILE_FLOP_MISMATCH; the orchestrator catches it and
+ *     pushes a warning into result.warnings.
  *
  * Also wraps __scrapeMultiStreet (and __scrapeResume if present) to
  * capture launch cfg + URL on window.__msLaunchCfg / window.__msLaunchUrl.
@@ -180,6 +187,22 @@
     const capsule = JSON.parse(capsuleStr);
     const tree = (capsule.checkpoint && capsule.checkpoint.tree) || 'UNKNOWN_TREE';
     const flop = (capsule.checkpoint && capsule.checkpoint.flop) || 'UNKNOWN_FLOP';
+
+    // POST-v18 BUG FIX (flop-mismatch guard): if the in-memory checkpoint's
+    //   flop disagrees with the URL's flop, the capsule is carrying stale
+    //   state from a prior run and must NOT be written to disk. This is a
+    //   belt-and-suspenders check on top of the orchestrator's fresh-launch
+    //   state clear; refuse to emit and surface a loud warning instead.
+    let urlFlop = null;
+    try { urlFlop = new URL(location.href).searchParams.get('flop'); } catch (_) {}
+    if (urlFlop && flop && urlFlop !== flop) {
+      const msg = `[hand-scraper] __msEmitResumeFile REFUSED: checkpoint.flop=${flop} but URL flop=${urlFlop} (stale checkpoint from a prior run). No resume.json emitted for event '${eventLabel}'.`;
+      try { console.warn(msg); } catch (_) {}
+      const err = new Error(msg);
+      err.code = 'MS_RESUME_FILE_FLOP_MISMATCH';
+      throw err;
+    }
+
     const fileName = `${tree}_${flop}_resume_${safeLabel}.json`;
 
     try {
@@ -326,8 +349,9 @@
   };
 
   window.__msV17ExtensionInstalled = true;
+  window.__msResumeFileFlopGuardInstalled = true;
   try {
-    console.log('[hand-scraper v17] capsule extension installed (__msDumpResumeCapsule, __msApplyResumeCapsule, __msEmitResumeFile). Pauses still come from v15; Claude must NEVER auto-continue them.');
+    console.log('[hand-scraper v17] capsule extension installed (__msDumpResumeCapsule, __msApplyResumeCapsule, __msEmitResumeFile + post-v18 flop-mismatch guard). Pauses still come from v15; Claude must NEVER auto-continue them.');
   } catch (_) {}
   return { v17_extension_loaded: true };
 })();

@@ -1,13 +1,24 @@
-/* combined_for_inline_inject.js — hand-scraper-postflop-flop-turn v18
+/* combined_for_inline_inject.js -- hand-scraper-postflop-flop-turn
+ *
+ * Built from @main on GitHub. No version tags -- always pulled from main.
  *
  * Layout:
- *   1) multi_street_walker.js (v18 — all-in no-descend + back-out chain collapse)
+ *   1) multi_street_walker.js (v18 -- all-in no-descend + back-out chain collapse)
  *   2) scrape_helpers.js (v15)
- *   3) scrape_multistreet.js (v17 — skip_flop_walk, emit_resume_file,
- *      chunk_max_raw_bytes, terminalFullyDone bug fix)
+ *   3) scrape_multistreet.js (post-v18 checkpoint-hygiene fix: fresh-launch
+ *      state clear + flop emit order swap; v17 skip_flop_walk +
+ *      emit_resume_file + chunk_max_raw_bytes + terminalFullyDone bug fix)
  *   4) scrape_resume.js (v15)
  *   5) post_reload_wizard.js (v15)
- *   6) combined_v17_extension.js (capsule helpers + __msEmitResumeFile)
+ *   6) combined_v17_extension.js (capsule helpers + __msEmitResumeFile
+ *      with post-v18 flop-mismatch guard)
+ *
+ * Banner identifier kept for legacy bootstraps that grep for the string
+ *   'hand-scraper-postflop-flop-turn v18'
+ * (e.g. older SKILL.md probe text); this bundle is compatible with that
+ * marker but contains the post-v18 checkpoint-hygiene fixes on top.
+ *
+ * hand-scraper-postflop-flop-turn v18 (+ checkpoint-hygiene fix)
  */
 
 /* ==================== 1) WALKER ==================== */
@@ -698,7 +709,6 @@
   window.__msV18WalkerInstalled = true;
   return 'multi-street walker installed (window.__W) [v18 all-in no-descend + back-out chain collapse; v15 random 3-5s inter-node wait; v13 plomm envelope support; v11 dynamic bet sizings + 1/5 pot static]';
 })();
-
 /* ==================== 2) HELPERS ==================== */
 /* scrape_helpers.js - Interceptors, binary blob decoder, per-node CSV+meta
  * processor, and zip writer for the multi-street scraper. Installs
@@ -1358,7 +1368,6 @@
   };
   return 'multi-street helpers installed (window.__msHelpers) [v15 banner-only republish; v14 labelToTypeSize static-map fix; v13 plomm envelope support; v11 dynamic bet sizings]';
 })();
-
 /* ==================== 3) ORCHESTRATOR v17 ==================== */
 /* scrape_multistreet.js - flop+turn tree scraper for the PLO Master Mind
  * postflop trainer. Walks (flop -> every canonical turn under every flop
@@ -1367,6 +1376,18 @@
  * (default N=5).
  *
  * Requires window.__W (walker) and window.__msHelpers to be installed first.
+ *
+ * POST-v18 CHANGES — checkpoint hygiene bug fixes (2026-05-20)
+ *   - FLOP EMIT ORDER: __msEmitResumeFile('after_flop_zip') now fires AFTER
+ *     saveCheckpoint(), matching the turn-chunk path. Previously the inverted
+ *     order let stale window.__msCheckpoint / localStorage state from a prior
+ *     run leak into the new run's first resume.json (mismatched flop names
+ *     between the freshly-emitted zip and the resume.json checkpoint).
+ *   - FRESH-LAUNCH STATE CLEAR: every non-resume invocation now clears
+ *     window.__msCheckpoint, localStorage __msCheckpoint_v15,
+ *     window.__msCachedFlopTerminals, and window.__msAllResumeFiles at
+ *     startup. Resume invocations (cfg.skip_flop_walk === true) preserve
+ *     prior state because that IS the work being resumed.
  *
  * v17 CHANGES — genuine flop-walk skip + auto resume.json + byte-threshold + bug fix
  *   - cfg.skip_flop_walk + cfg.cached_flop_terminals: bypass the flop DFS on
@@ -1685,6 +1706,22 @@
     window.__msQuotaExceeded = null;
     window.__msPaused = false;
     window.__msAborted = false;
+    // POST-v18 BUG FIX (checkpoint hygiene): clear stale checkpoint state at
+    //   the start of every fresh (non-resume) launch. Without this, a prior
+    //   run's checkpoint (still on window.__msCheckpoint and/or in
+    //   localStorage under '__msCheckpoint_v15') leaks into the first
+    //   resume.json emitted on the new run -- observable as a flop mismatch
+    //   between the URL / flop_zip filename (new run) and the
+    //   checkpoint.flop / zips_emitted inside the resume.json (old run).
+    //   A resume invocation supplies cfg.skip_flop_walk + cfg.cached_flop_terminals;
+    //   in that case we keep the existing checkpoint because it IS this run's
+    //   prior state being carried forward.
+    if (cfg.skip_flop_walk !== true) {
+      window.__msCheckpoint = null;
+      try { localStorage.removeItem(CHECKPOINT_KEY); } catch (_) {}
+      window.__msCachedFlopTerminals = null;
+      window.__msAllResumeFiles = [];
+    }
     if (typeof H.resetZipCompressionState === 'function') {
       H.resetZipCompressionState();
     }
@@ -1821,7 +1858,13 @@
             result.flop_zip_emitted_at = new Date().toISOString();
           }
           log('flop_zip_emitted', { name: flopZipName, files: zipEntry?.files });
-          // v17: emit resume.json alongside the flop zip
+          // POST-v18 BUG FIX (flop emit order): checkpoint MUST be saved BEFORE
+          //   __msEmitResumeFile so the resume.json captures this-run state, not
+          //   leftover state from a prior run. The turn-chunk path below was
+          //   already in the correct order; only the flop path was inverted.
+          saveCheckpoint(buildCheckpoint({ last_event: 'flop_zip_emitted', last_zip: flopZipName }));
+          // v17: emit resume.json alongside the flop zip (now reads the
+          //   just-saved checkpoint).
           if (emitResumeFile && typeof window.__msEmitResumeFile === 'function') {
             try {
               await window.__msEmitResumeFile('after_flop_zip', downloadDelayMs);
@@ -1829,8 +1872,6 @@
               result.warnings.push(`emit_resume_file (after_flop_zip) failed: ${e.message}`);
             }
           }
-          // v15: checkpoint + pause after flop zip.
-          saveCheckpoint(buildCheckpoint({ last_event: 'flop_zip_emitted', last_zip: flopZipName }));
           if (!autoContinue) await pauseUntilContinue(`flop zip emitted (${flopZipName})`);
         }
       }
@@ -2371,7 +2412,8 @@
     }
   };
 
-  return 'multi-street scraper installed (window.__scrapeMultiStreet) [v17 skip_flop_walk + cached_flop_terminals + emit_resume_file + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
+  window.__msCheckpointHygieneFixed = true;
+  return 'multi-street scraper installed (window.__scrapeMultiStreet) [post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + emit_resume_file + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
 })();
 
 /* ==================== 4) RESUME ==================== */
@@ -3183,7 +3225,6 @@
 
   return 'resume orchestrator installed (window.__scrapeResume + window.__scrapeResumeProbeQuota) [v15 5-card chunk threshold + pause/checkpoint; 3-5s inter-node wait via walker]';
 })();
-
 /* ==================== 5) POST-RELOAD WIZARD ==================== */
 /* post_reload_wizard.js - helpers for building a fresh-run cfg that mimics
  * resume semantics after a tab reload wiped __scrapeResume's prerequisites.
@@ -3382,11 +3423,10 @@
 
   console.log('post-reload wizard installed (window.__buildPostReloadResumeCfg, window.__describeFlopTurnCardOrder) [v15 banner-only republish]');
 })();
-
 /* ==================== 6) V17 CAPSULE EXTENSION ==================== */
-/* combined_v17_extension.js — hand-scraper-postflop-flop-turn v17
+/* combined_v17_extension.js -- hand-scraper-postflop-flop-turn
  *
- * ADDITIVE extension on top of the v17 orchestrator. Installs:
+ * ADDITIVE extension on top of the orchestrator. Installs:
  *
  *   window.__msDumpResumeCapsule(opts?)
  *     Returns a JSON string capsule containing EVERYTHING needed for a
@@ -3404,8 +3444,15 @@
  *   window.__msEmitResumeFile(eventLabel, downloadDelayMs)
  *     Builds a capsule and triggers a browser download of
  *     `<tree>_<flop>_resume_<eventLabel>.json`. Called automatically
- *     by the v17 orchestrator after every zip emit. Can also be called
+ *     by the orchestrator after every zip emit. Can also be called
  *     manually from DevTools at any time.
+ *
+ *     POST-v18 BUG FIX (2026-05-20): refuses to emit if the checkpoint's
+ *     flop does not match the URL's flop param. This catches the case
+ *     where stale state from a prior run leaks into a fresh launch's
+ *     first resume.json. Throws an Error with code
+ *     MS_RESUME_FILE_FLOP_MISMATCH; the orchestrator catches it and
+ *     pushes a warning into result.warnings.
  *
  * Also wraps __scrapeMultiStreet (and __scrapeResume if present) to
  * capture launch cfg + URL on window.__msLaunchCfg / window.__msLaunchUrl.
@@ -3566,6 +3613,22 @@
     const capsule = JSON.parse(capsuleStr);
     const tree = (capsule.checkpoint && capsule.checkpoint.tree) || 'UNKNOWN_TREE';
     const flop = (capsule.checkpoint && capsule.checkpoint.flop) || 'UNKNOWN_FLOP';
+
+    // POST-v18 BUG FIX (flop-mismatch guard): if the in-memory checkpoint's
+    //   flop disagrees with the URL's flop, the capsule is carrying stale
+    //   state from a prior run and must NOT be written to disk. This is a
+    //   belt-and-suspenders check on top of the orchestrator's fresh-launch
+    //   state clear; refuse to emit and surface a loud warning instead.
+    let urlFlop = null;
+    try { urlFlop = new URL(location.href).searchParams.get('flop'); } catch (_) {}
+    if (urlFlop && flop && urlFlop !== flop) {
+      const msg = `[hand-scraper] __msEmitResumeFile REFUSED: checkpoint.flop=${flop} but URL flop=${urlFlop} (stale checkpoint from a prior run). No resume.json emitted for event '${eventLabel}'.`;
+      try { console.warn(msg); } catch (_) {}
+      const err = new Error(msg);
+      err.code = 'MS_RESUME_FILE_FLOP_MISMATCH';
+      throw err;
+    }
+
     const fileName = `${tree}_${flop}_resume_${safeLabel}.json`;
 
     try {
@@ -3712,8 +3775,9 @@
   };
 
   window.__msV17ExtensionInstalled = true;
+  window.__msResumeFileFlopGuardInstalled = true;
   try {
-    console.log('[hand-scraper v17] capsule extension installed (__msDumpResumeCapsule, __msApplyResumeCapsule, __msEmitResumeFile). Pauses still come from v15; Claude must NEVER auto-continue them.');
+    console.log('[hand-scraper v17] capsule extension installed (__msDumpResumeCapsule, __msApplyResumeCapsule, __msEmitResumeFile + post-v18 flop-mismatch guard). Pauses still come from v15; Claude must NEVER auto-continue them.');
   } catch (_) {}
   return { v17_extension_loaded: true };
 })();
