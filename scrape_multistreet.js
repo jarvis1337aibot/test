@@ -499,6 +499,20 @@
         for (const n of result.nodes) result.nodesByKeyShortcut.set(n.key, n);
       }
 
+      // POST-TIER-1 HOTFIX (2026-05-22): set window.__msCachedFlopTerminals
+      //   BEFORE the flop zip is emitted + saveCheckpoint runs. Previously
+      //   this assignment lived after the zip emit path, which meant the
+      //   auto-emitted resume.json on `after_flop_zip` always had
+      //   cached_flop_terminals: [] on a fresh run.
+      if (!skipFlopWalk && flopNodes && flopNodes.length) {
+        try {
+          const _earlyTerminals = identifyTerminals(flopNodes, 'flop');
+          window.__msCachedFlopTerminals = _earlyTerminals.map(t => ({
+            parent: t.parent, terminal_node: t.terminal_node, via: t.via, code: t.code,
+          }));
+        } catch (_) { /* defensive */ }
+      }
+
       if (!dryRun && !skipFlopWalk) {
         window.__msProgress.phase = 'scraping_flop';
         const flopZipName = `${result.tree}_${result.flop}_flop.zip`;
@@ -1240,6 +1254,8 @@
   window.__msPhase7EmergencyHookInstalled = true;
   window.__msTier1FixesInstalled = true;
   window.__msTier23OrchInstalled = true;
+  window.__msCachedTerminalsEarlySetInstalled = true; // POST-TIER-1 HOTFIX 2026-05-22
+  window.__msCategoriesPanelBroadLabelsInstalled = true; // POST-TIER-3 HOTFIX 2026-05-22 (declared here for probe convenience)
 
   // ---------------------------------------------------------------------
   // PHASE 3: __scrapeSession -- convenience wrapper for the multi-device

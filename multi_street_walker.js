@@ -190,10 +190,15 @@
       );
     } catch (_) {}
     if (!catLabel) return null;
+    // POST-TIER-3 FIX (2026-05-22): broaden category-label match.
+    //   Previously hard-coded "Unpaired" which is absent on paired boards
+    //   (e.g. 4s4d2c shows Quads/Full House/Trips/One pair/Draws/Air, no
+    //   "Unpaired"). Match any PLO category leaf label instead.
+    const CATEGORY_LABELS_RE = /\b(Unpaired|One pair|One Pair|Two pair|Two Pair|Set|Trips|Quads|Full House|Straight|Flush|Draws|Air|Overpair|Pair)\b/;
     let panel = catLabel;
     while (panel) {
       const txt = panel.textContent || '';
-      if (txt.includes('Unpaired') && /\d+\.\d{2}%/.test(txt) && panel !== document.body) {
+      if (CATEGORY_LABELS_RE.test(txt) && /\d+\.\d{2}%/.test(txt) && panel !== document.body) {
         // Exclude the whole app shell (which also contains everything else)
         let w = 9999;
         try { w = panel.getBoundingClientRect().width; } catch (_) {}

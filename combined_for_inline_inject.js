@@ -5,6 +5,14 @@
  *   - Tier 2: Categories-tab auto-activate + pretendPartialBrowse primitive
  *   - Tier 3: cfg.shuffle_cards (random visit order) + human_like.partial_browse_chance
  *
+ * POST-TIER hotfixes (2026-05-22 second pass):
+ *   - cached_flop_terminals now set BEFORE saveCheckpoint on fresh flop walks
+ *     (previously only set after, leaving resume.json with empty terminals)
+ *   - Categories panel locator widened to match any PLO category leaf label
+ *     (Unpaired | One pair | Two Pair | Set | Trips | Quads | Full House |
+ *     Straight | Flush | Draws | Air | Overpair | Pair), fixing paired-board
+ *     locator failure on flops like 4s4d2c where "Unpaired" never appears.
+ *
  * Banner identifier kept stable: bootstrap grep checks for
  *   'hand-scraper-postflop-flop-turn'
  */
@@ -202,10 +210,15 @@
       );
     } catch (_) {}
     if (!catLabel) return null;
+    // POST-TIER-3 FIX (2026-05-22): broaden category-label match.
+    //   Previously hard-coded "Unpaired" which is absent on paired boards
+    //   (e.g. 4s4d2c shows Quads/Full House/Trips/One pair/Draws/Air, no
+    //   "Unpaired"). Match any PLO category leaf label instead.
+    const CATEGORY_LABELS_RE = /\b(Unpaired|One pair|One Pair|Two pair|Two Pair|Set|Trips|Quads|Full House|Straight|Flush|Draws|Air|Overpair|Pair)\b/;
     let panel = catLabel;
     while (panel) {
       const txt = panel.textContent || '';
-      if (txt.includes('Unpaired') && /\d+\.\d{2}%/.test(txt) && panel !== document.body) {
+      if (CATEGORY_LABELS_RE.test(txt) && /\d+\.\d{2}%/.test(txt) && panel !== document.body) {
         // Exclude the whole app shell (which also contains everything else)
         let w = 9999;
         try { w = panel.getBoundingClientRect().width; } catch (_) {}
@@ -1027,6 +1040,7 @@
   window.__msTier2NoiseInstalled = true;
   return 'multi-street walker installed (window.__W) [tier 2 noise: categories-tab activate + partial-browse; phase 7 safety detect + emergency stop emit; phase 4 human-like noise (long pauses + hover bursts + category exploration); v18 all-in no-descend + back-out chain collapse; v15 random 3-5s inter-node wait; v13 plomm envelope support; v11 dynamic bet sizings + 1/5 pot static]';
 })();
+
 /* ==================== 2) HELPERS ==================== */
 /* scrape_helpers.js - Interceptors, binary blob decoder, per-node CSV+meta
  * processor, and zip writer for the multi-street scraper. Installs
@@ -1686,6 +1700,7 @@
   };
   return 'multi-street helpers installed (window.__msHelpers) [v15 banner-only republish; v14 labelToTypeSize static-map fix; v13 plomm envelope support; v11 dynamic bet sizings]';
 })();
+
 /* ==================== 3) ORCHESTRATOR (tier 1 + 2/3) ==================== */
 /* scrape_multistreet.js - flop+turn tree scraper for the PLO Master Mind
  * postflop trainer. Walks (flop -> every canonical turn under every flop
@@ -2186,6 +2201,20 @@
 
         result.nodesByKeyShortcut = new Map();
         for (const n of result.nodes) result.nodesByKeyShortcut.set(n.key, n);
+      }
+
+      // POST-TIER-1 HOTFIX (2026-05-22): set window.__msCachedFlopTerminals
+      //   BEFORE the flop zip is emitted + saveCheckpoint runs. Previously
+      //   this assignment lived after the zip emit path, which meant the
+      //   auto-emitted resume.json on `after_flop_zip` always had
+      //   cached_flop_terminals: [] on a fresh run.
+      if (!skipFlopWalk && flopNodes && flopNodes.length) {
+        try {
+          const _earlyTerminals = identifyTerminals(flopNodes, 'flop');
+          window.__msCachedFlopTerminals = _earlyTerminals.map(t => ({
+            parent: t.parent, terminal_node: t.terminal_node, via: t.via, code: t.code,
+          }));
+        } catch (_) { /* defensive */ }
       }
 
       if (!dryRun && !skipFlopWalk) {
@@ -2929,6 +2958,8 @@
   window.__msPhase7EmergencyHookInstalled = true;
   window.__msTier1FixesInstalled = true;
   window.__msTier23OrchInstalled = true;
+  window.__msCachedTerminalsEarlySetInstalled = true; // POST-TIER-1 HOTFIX 2026-05-22
+  window.__msCategoriesPanelBroadLabelsInstalled = true; // POST-TIER-3 HOTFIX 2026-05-22 (declared here for probe convenience)
 
   // ---------------------------------------------------------------------
   // PHASE 3: __scrapeSession -- convenience wrapper for the multi-device
@@ -3022,6 +3053,7 @@
 
   return 'multi-street scraper installed (window.__scrapeMultiStreet, window.__scrapeSession) [tier 2/3 orch: categories-activate + partial-browse + shuffle_cards; tier-1 fixes: all-terminals-cached + per-card-manifest + modal-cleanup; phase 7 emergency-stop hook; phase 4 human-like noise wired (cfg.human_like -> window.__msHumanCfg + turn hover hook); phase 3 session wrapper; phase 2 card maps + target_cards_per_terminal; phase 1 session mode (zip_per_card + device_name + session_id); post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + emit_resume_file + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
 })();
+
 
 /* ==================== 4) RESUME ==================== */
 /* scrape_resume.js - resume orchestrator for partially completed flop+turn runs.
@@ -3832,6 +3864,7 @@
 
   return 'resume orchestrator installed (window.__scrapeResume + window.__scrapeResumeProbeQuota) [v15 5-card chunk threshold + pause/checkpoint; 3-5s inter-node wait via walker]';
 })();
+
 /* ==================== 5) POST-RELOAD WIZARD ==================== */
 /* post_reload_wizard.js - helpers for building a fresh-run cfg that mimics
  * resume semantics after a tab reload wiped __scrapeResume's prerequisites.
@@ -4030,6 +4063,7 @@
 
   console.log('post-reload wizard installed (window.__buildPostReloadResumeCfg, window.__describeFlopTurnCardOrder) [v15 banner-only republish]');
 })();
+
 /* ==================== 6) V17 CAPSULE EXTENSION ==================== */
 /* combined_v17_extension.js -- hand-scraper-postflop-flop-turn
  *
@@ -4414,3 +4448,4 @@
   } catch (_) {}
   return { v17_extension_loaded: true };
 })();
+
