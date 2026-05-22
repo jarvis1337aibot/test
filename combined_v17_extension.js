@@ -154,6 +154,8 @@
           Object.entries(ckpt.completed_cards_per_terminal || {}).map(([k, v]) => [k, v.slice()])
         ),
         next_chunk_index_per_terminal: Object.assign({}, ckpt.next_chunk_index_per_terminal || {}),
+        // PHASE 2: surface terminal card maps (full data already in checkpoint.terminal_card_maps).
+        terminal_card_maps_terminals: ckpt.terminal_card_maps ? Object.keys(ckpt.terminal_card_maps) : [],
         zips_emitted: (ckpt.zips_emitted || []).map(z => z.name),
         last_event: ckpt.extra && ckpt.extra.last_event,
         terminal_exit_reason: ckpt.extra && ckpt.extra.terminal_exit_reason,
@@ -178,15 +180,15 @@
   //    <tree>_<flop>_resume_<eventLabel>.json containing the current capsule.
   //    Called automatically by the v17 orchestrator after every zip emit.
   // ---------------------------------------------------------------------
-  window.__msEmitResumeFile = async function(eventLabel, downloadDelayMs) {
+  window.__msEmitResumeFile = async function(eventLabel, downloadDelayMs, opts) {
     eventLabel = eventLabel || 'manual';
+    opts = opts || {};
     const safeLabel = String(eventLabel).replace(/[^A-Za-z0-9_-]/g, '_');
     downloadDelayMs = (typeof downloadDelayMs === 'number') ? downloadDelayMs : 250;
 
-    const capsuleStr = window.__msDumpResumeCapsule({ silent: true });
-    const capsule = JSON.parse(capsuleStr);
-    const tree = (capsule.checkpoint && capsule.checkpoint.tree) || 'UNKNOWN_TREE';
-    const flop = (capsule.checkpoint && capsule.checkpoint.flop) || 'UNKNOWN_FLOP';
+    const capsuleObj = JSON.parse(window.__msDumpResumeCapsule({ silent: true }));
+    const tree = (capsuleObj.checkpoint && capsuleObj.checkpoint.tree) || 'UNKNOWN_TREE';
+    const flop = (capsuleObj.checkpoint && capsuleObj.checkpoint.flop) || 'UNKNOWN_FLOP';
 
     // POST-v18 BUG FIX (flop-mismatch guard): if the in-memory checkpoint's
     //   flop disagrees with the URL's flop, the capsule is carrying stale
@@ -203,7 +205,29 @@
       throw err;
     }
 
-    const fileName = `${tree}_${flop}_resume_${safeLabel}.json`;
+    // PHASE 1: per-card naming when opts identifies a single (terminal, card)
+    //   in zip_per_card mode. JSON payload also gets device + session_id +
+    //   session_meta so downstream tooling can attribute the capsule without
+    //   re-parsing the filename.
+    let fileName;
+    if (opts.zip_per_card && opts.terminal && opts.card) {
+      const safeTerm = String(opts.terminal).replace(/[^A-Za-z0-9_-]/g, '_');
+      const safeCard = String(opts.card).replace(/[^A-Za-z0-9_-]/g, '_');
+      const safeDev  = String(opts.device || 'unknown').replace(/[^A-Za-z0-9_-]/g, '_');
+      fileName = `${tree}_${flop}_${safeTerm}_${safeCard}_${safeDev}_resume.json`;
+      capsuleObj.device = opts.device || null;
+      capsuleObj.session_id = opts.session_id || null;
+      capsuleObj.session_emitted_at = new Date().toISOString();
+      capsuleObj.session_meta = {
+        terminal: opts.terminal,
+        card: opts.card,
+        device: opts.device || null,
+        session_id: opts.session_id || null,
+      };
+    } else {
+      fileName = `${tree}_${flop}_resume_${safeLabel}.json`;
+    }
+    const capsuleStr = JSON.stringify(capsuleObj, null, 2);
 
     try {
       const blob = new Blob([capsuleStr], { type: 'application/json' });
@@ -350,6 +374,8 @@
 
   window.__msV17ExtensionInstalled = true;
   window.__msResumeFileFlopGuardInstalled = true;
+  window.__msPhase1ResumeFileOptsInstalled = true;
+  window.__msPhase2CapsuleSummaryInstalled = true;
   try {
     console.log('[hand-scraper v17] capsule extension installed (__msDumpResumeCapsule, __msApplyResumeCapsule, __msEmitResumeFile + post-v18 flop-mismatch guard). Pauses still come from v15; Claude must NEVER auto-continue them.');
   } catch (_) {}

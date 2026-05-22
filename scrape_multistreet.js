@@ -298,7 +298,35 @@
     if (typeof cfg.node_wait_min_ms === 'number') window.__msNodeWaitMin = cfg.node_wait_min_ms;
     if (typeof cfg.node_wait_max_ms === 'number') window.__msNodeWaitMax = cfg.node_wait_max_ms;
     // v15: turn-cards-per-chunk threshold (default 5).
-    const turnCardsPerChunk = (typeof cfg.turn_cards_per_chunk === 'number' && cfg.turn_cards_per_chunk > 0) ? cfg.turn_cards_per_chunk : 5;
+    let   turnCardsPerChunk = (typeof cfg.turn_cards_per_chunk === 'number' && cfg.turn_cards_per_chunk > 0) ? cfg.turn_cards_per_chunk : 5;
+    // PHASE 1 (session mode): per-card zip + resume.json naming.
+    //   zip_per_card  forces turnCardsPerChunk = 1 so every chunk-emit is
+    //                 exactly one card (atomic per-card output).
+    //   device_name   string identifying the device (lives only inside the
+    //                 resume.json filename + payload, NOT in the zip name --
+    //                 zip names stay clean: <tree>_<flop>_<terminal>_<card>.zip).
+    //   session_id    string tagging this run; appears inside the resume.json
+    //                 payload + run log entries.
+    const zipPerCard = cfg.zip_per_card === true;
+    const deviceName = (typeof cfg.device_name === 'string' && cfg.device_name.length > 0) ? cfg.device_name : null;
+    const sessionId  = (typeof cfg.session_id  === 'string' && cfg.session_id.length  > 0) ? cfg.session_id  : null;
+    if (zipPerCard) { turnCardsPerChunk = 1; }
+    // PHASE 2: optional explicit card targets per terminal. When provided
+    //   for a terminal, the walker visits ONLY those cards, in the order
+    //   given. Caller (planner) typically pre-shuffles. When absent for
+    //   a terminal, the existing top-to-bottom DOM order is used.
+    //   Shape: { 'C-R50-C': ['Qs','9s','Td'], 'R66-C': ['As'], ... }
+    const targetCardsPerTerminal = (cfg.target_cards_per_terminal && typeof cfg.target_cards_per_terminal === 'object')
+      ? cfg.target_cards_per_terminal
+      : null;
+    // PHASE 4: human-like noise cfg. Default null -> all off. When provided,
+    //   gets exported to window.__msHumanCfg for the walker to read.
+    if (cfg.human_like && typeof cfg.human_like === 'object') {
+      window.__msHumanCfg = Object.assign({}, cfg.human_like);
+    } else {
+      window.__msHumanCfg = window.__msHumanCfg || {};
+    }
+    const humanCfg = window.__msHumanCfg;
     // v15: auto-continue defaults to false → orchestrator pauses after each zip.
     const autoContinue = cfg.auto_continue === true;
     // v17: byte-size OR trigger — flush chunk when raw bytes >= this many,
@@ -362,6 +390,10 @@
       started_at: new Date().toISOString(),
       nodes: [], warnings: [], events: [], aliases: [],
       summary: {}, zips: [],
+      // PHASE 2: card map captured at first turn-modal open per terminal.
+      //   Shape: { [terminal]: {recorded_at, recorded_by_device, total_cells,
+      //                         available: [...], used: [...], dim_dom: [...]} }
+      terminal_card_maps: {},
     };
     const log = (kind, data) => result.events.push({ ts: Date.now(), kind, ...(data || {}) });
     const flop = result.flop;
@@ -391,6 +423,8 @@
         completed_cards_per_terminal: Object.fromEntries(
           Object.entries(completedCardsPerTerminal).map(([k, v]) => [k, v.slice()])
         ),
+        // PHASE 2: card map snapshots collected at first per-terminal open.
+        terminal_card_maps: Object.assign({}, result.terminal_card_maps || {}),
         aliases: result.aliases.slice(),
         zips_emitted: result.zips.map(z => ({
           kind: z.kind, name: z.name,
@@ -613,7 +647,16 @@
         async function flushChunk(reason) {
           if (chunkState.files.length === 0) return null;
           const idxStr = String(chunkState.chunkIndex).padStart(3, '0');
-          const chunkZipName = `${result.tree}_${result.flop}_${ft.terminal_node}_turn_chunk${idxStr}.zip`;
+          // PHASE 1: zip name pattern depends on zipPerCard mode.
+          //   Off (legacy): <tree>_<flop>_<terminal>_turn_chunk<NNN>.zip
+          //   On  (per-card): <tree>_<flop>_<terminal>_<turn_card>.zip
+          // Capture card name BEFORE the chunk reset later in this function.
+          const cardForName = (zipPerCard && chunkState.contents[0] && chunkState.contents[0].turn_card)
+            ? chunkState.contents[0].turn_card
+            : null;
+          const chunkZipName = (zipPerCard && cardForName)
+            ? `${result.tree}_${result.flop}_${ft.terminal_node}_${cardForName}.zip`
+            : `${result.tree}_${result.flop}_${ft.terminal_node}_turn_chunk${idxStr}.zip`;
           const chunkManifest = {
             tree: result.tree, flop: result.flop, scope, chipsPerBb,
             segment_kind: 'turn_card_chunk',
@@ -665,11 +708,29 @@
           chunkState.contents = [];
           // v15: checkpoint + pause after each chunk zip.
           saveCheckpoint(buildCheckpoint({ last_event: 'turn_chunk_emitted', last_zip: chunkZipName, last_terminal: ft.terminal_node }));
-          // v17: emit resume.json alongside the chunk zip
+          // v17 + PHASE 1: emit resume.json alongside the chunk zip.
+          //   Legacy: event = `after_<terminal>_chunk<NNN>`; flat filename.
+          //   Phase 1 (zipPerCard): event = `after_<terminal>_<card>`; filename
+          //   becomes `<tree>_<flop>_<terminal>_<card>_<device>_resume.json` and
+          //   the JSON payload is augmented with device/session_id/session_meta.
           if (emitResumeFile && typeof window.__msEmitResumeFile === 'function') {
             try {
               const safeFt = ft.terminal_node.replace(/[^A-Za-z0-9_-]/g, '_');
-              await window.__msEmitResumeFile(`after_${safeFt}_chunk${idxStr}`, downloadDelayMs);
+              if (zipPerCard && cardForName) {
+                await window.__msEmitResumeFile(
+                  `after_${safeFt}_${cardForName}`,
+                  downloadDelayMs,
+                  {
+                    zip_per_card: true,
+                    terminal: ft.terminal_node,
+                    card: cardForName,
+                    device: deviceName,
+                    session_id: sessionId,
+                  }
+                );
+              } else {
+                await window.__msEmitResumeFile(`after_${safeFt}_chunk${idxStr}`, downloadDelayMs);
+              }
             } catch (e) {
               result.warnings.push(`emit_resume_file (chunk ${chunkZipName}) failed: ${e.message}`);
             }
@@ -933,6 +994,28 @@
             log('quota_or_user_abort', { phase: 'cell_loop', terminal: ft.terminal_node });
             break;
           }
+          // PHASE 7: safety detection at safe boundary.
+          //   If unexpected state (captcha, login redirect, page change),
+          //   emit emergency-stop file + abort the run gracefully.
+          if (typeof W.detectUnexpectedState === 'function' && !window.__msEmergencyStop) {
+            const bad = W.detectUnexpectedState();
+            if (bad) {
+              window.__msEmergencyStop = true;
+              window.__msAborted = true;
+              terminalExitReason = 'emergency_stop';
+              try {
+                W.emitEmergencyStopFile({
+                  device: cfg.device_name || null,
+                  session_id: cfg.session_id || null,
+                  tree: result.tree, flop: result.flop, terminal: ft.terminal_node,
+                  reason: bad.reason, detail: bad.detail,
+                });
+              } catch (_) {}
+              result.warnings.push(`EMERGENCY STOP: ${bad.reason} -- check Drive emergency_stops/ and clear <device>.active.emergencystop.json to resume`);
+              log('emergency_stop', { terminal: ft.terminal_node, reason: bad.reason });
+              break outer;
+            }
+          }
           if (canonicalsWalkedThisTerminal >= turnCardLimit) { terminalExitReason = 'turn_card_limit'; break; }
           if (W.modalKind() !== 'turn') {
             const er = await ensureTurnModalAtTerminal();
@@ -943,9 +1026,45 @@
           }
           await W.dismissNoSimPopupIfAny();
           const cells = W.readModalCells('turn');
+
+          // PHASE 2: capture full card map once per terminal (first cell read).
+          //   Drives state/card_maps/<tree>/<flop>/<terminal>.json downstream
+          //   so other devices/sessions can pick cards without re-inspecting.
+          if (!result.terminal_card_maps[ft.terminal_node]) {
+            result.terminal_card_maps[ft.terminal_node] = {
+              recorded_at: new Date().toISOString(),
+              recorded_by_device: deviceName || null,
+              recorded_by_session: sessionId || null,
+              total_cells: cells.length,
+              available: cells.filter(c => c.status === 'ok').map(c => c.card),
+              used:      cells.filter(c => c.status === 'used').map(c => c.card),
+              dim_dom:   cells.filter(c => c.status === 'dim').map(c => c.card),
+            };
+            log('terminal_card_map_captured', {
+              terminal: ft.terminal_node,
+              n_available: result.terminal_card_maps[ft.terminal_node].available.length,
+              n_used:      result.terminal_card_maps[ft.terminal_node].used.length,
+              n_dim_dom:   result.terminal_card_maps[ft.terminal_node].dim_dom.length,
+            });
+          }
+
+          // PHASE 2: target-cards-aware cell pick.
+          //   With targetCardsPerTerminal[terminal] provided: iterate the
+          //   given list in order, pick the first card that maps to an
+          //   available cell. Aliased/dim cards are recorded as alias-hits
+          //   and skipped (consistent with legacy behavior).
+          //   Without: fall back to legacy top-to-bottom DOM order.
           let target = null;
-          for (const c of cells) {
-            if (visitedThisTerminal.has(c.card)) continue;
+          const targetList = (targetCardsPerTerminal && Array.isArray(targetCardsPerTerminal[ft.terminal_node]))
+            ? targetCardsPerTerminal[ft.terminal_node]
+            : null;
+          const cellByCard = new Map(cells.map(c => [c.card, c]));
+          const iterCards = targetList ? targetList : cells.map(c => c.card);
+
+          for (const wantedCard of iterCards) {
+            if (visitedThisTerminal.has(wantedCard)) continue;
+            const c = cellByCard.get(wantedCard);
+            if (!c) continue;                 // wanted card not in modal (e.g. typo)
             if (c.status === 'used') continue;
             if (knownAliases.has(c.card) || knownDim.has(c.card)) {
               visitedThisTerminal.add(c.card);
@@ -971,6 +1090,18 @@
             break outer;
           }
           visitedThisTerminal.add(target.card);
+          // PHASE 4: hover 1-3 sibling cards before committing to target.
+          //   No clicks -> no /range/url. Gated on cfg.human_like.turn_hover_count_range.
+          try {
+            const hr = humanCfg && humanCfg.turn_hover_count_range;
+            if (Array.isArray(hr) && hr.length === 2 && hr[1] > 0) {
+              const lo = Math.max(0, hr[0]|0), hi = Math.max(lo, hr[1]|0);
+              const k = lo + Math.floor(Math.random() * (hi - lo + 1));
+              if (k > 0 && typeof W.humanTurnBrowseHover === 'function') {
+                await W.humanTurnBrowseHover(target.card, k);
+              }
+            }
+          } catch (_) {}
           const verdict = await handleOneCell(target.card, target.status);
           if (verdict === 'break') break outer;
         }
@@ -1042,6 +1173,102 @@
   };
 
   window.__msCheckpointHygieneFixed = true;
-  return 'multi-street scraper installed (window.__scrapeMultiStreet) [post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + emit_resume_file + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
+  window.__msPhase1SessionModeInstalled = true;
+  window.__msPhase2CardMapsInstalled = true;
+  window.__msPhase3SessionWrapperInstalled = true;
+  window.__msPhase4OrchestratorWiredInstalled = true;
+  window.__msPhase7EmergencyHookInstalled = true;
+
+  // ---------------------------------------------------------------------
+  // PHASE 3: __scrapeSession -- convenience wrapper for the multi-device
+  // session workflow. Takes a session spec produced by build_plan.py:
+  //
+  //   {
+  //     tree: 'PLO5C_100_2_SB_BB_3BP',
+  //     flop: 'Js8c2h',
+  //     terminal: 'C-R50-C',
+  //     cards: ['Qs','9s','Td'],          // walked in this order
+  //     device: 'main',
+  //     session_id: '9e3d-...-fa1b',
+  //     cached_flop_terminals: [...],     // from ledger (Phase 1)
+  //   }
+  //
+  // Plus optional overrides:
+  //   {
+  //     auto_continue: true,              // default true for sessions
+  //     node_wait_min_ms / node_wait_max_ms,
+  //     download_delay_ms,
+  //     ...any other cfg knob accepted by __scrapeMultiStreet
+  //   }
+  //
+  // Builds the right cfg for __scrapeMultiStreet:
+  //   - zip_per_card: true (Phase 1)
+  //   - skip_flop_walk: true + cached_flop_terminals (Phase 1, no flop re-walk)
+  //   - flop_terminal_filter: walks only the target terminal
+  //   - target_cards_per_terminal: only the listed cards, in given order (Phase 2)
+  //   - turn_card_limit: cards.length (safety belt)
+  //
+  // Returns the __scrapeMultiStreet result, with session_summary appended.
+  // ---------------------------------------------------------------------
+  if (typeof window.__scrapeSession !== 'function') {
+    window.__scrapeSession = async function(spec) {
+      spec = spec || {};
+      if (!spec.tree || !spec.flop || !spec.terminal) {
+        throw new Error('__scrapeSession: spec.tree, spec.flop, spec.terminal are required');
+      }
+      if (!Array.isArray(spec.cards) || spec.cards.length === 0) {
+        throw new Error('__scrapeSession: spec.cards must be a non-empty array');
+      }
+      if (!spec.cached_flop_terminals || !spec.cached_flop_terminals.length) {
+        throw new Error('__scrapeSession: spec.cached_flop_terminals is required (read from ledger)');
+      }
+      const cfg = Object.assign({
+        scope: 'flop+turn',
+        zip_per_card: true,
+        auto_continue: true,
+      }, spec.cfg_overrides || {});
+      cfg.device_name = spec.device || cfg.device_name;
+      cfg.session_id  = spec.session_id || cfg.session_id;
+      cfg.skip_flop_walk = true;
+      cfg.cached_flop_terminals = spec.cached_flop_terminals;
+      cfg.flop_terminal_filter = (function(targetTerm) {
+        return function(t) { return t === targetTerm; };
+      })(spec.terminal);
+      cfg.target_cards_per_terminal = Object.assign(
+        {},
+        cfg.target_cards_per_terminal || {},
+        { [spec.terminal]: spec.cards.slice() }
+      );
+      cfg.turn_card_limit = spec.cards.length;
+      const sessionStartedAt = new Date().toISOString();
+      try { console.log('[hand-scraper phase3] __scrapeSession launching', {
+        tree: spec.tree, flop: spec.flop, terminal: spec.terminal,
+        cards: spec.cards, device: cfg.device_name, session_id: cfg.session_id
+      }); } catch (_) {}
+      const result = await window.__scrapeMultiStreet(cfg);
+      result.session_summary = {
+        session_id: cfg.session_id || null,
+        device: cfg.device_name || null,
+        tree: spec.tree,
+        flop: spec.flop,
+        terminal: spec.terminal,
+        cards_planned: spec.cards.slice(),
+        cards_walked: (result.zips || [])
+          .filter(z => z.kind === 'turn_card_chunk' && Array.isArray(z.turn_cards))
+          .reduce((acc, z) => acc.concat(z.turn_cards), []),
+        zips_emitted: (result.zips || []).map(z => z.name),
+        captures: result.summary && result.summary.captures,
+        started_at: sessionStartedAt,
+        finished_at: result.finished_at,
+        elapsed_s: result.elapsed_s,
+        aborted_by_user: !!result.aborted_by_user,
+        aborted_due_to_quota: !!result.aborted_due_to_quota,
+      };
+      window.__msSessionResult = result;
+      return result;
+    };
+  }
+
+  return 'multi-street scraper installed (window.__scrapeMultiStreet, window.__scrapeSession) [phase 7 emergency-stop hook; phase 4 human-like noise wired (cfg.human_like -> window.__msHumanCfg + turn hover hook); phase 3 session wrapper; phase 2 card maps + target_cards_per_terminal; phase 1 session mode (zip_per_card + device_name + session_id); post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + emit_resume_file + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
 })();
 

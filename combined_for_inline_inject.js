@@ -1,27 +1,15 @@
 /* combined_for_inline_inject.js -- hand-scraper-postflop-flop-turn
  *
- * Built from @main on GitHub. No version tags -- always pulled from main.
+ * Built from @main on GitHub. Phases 1-8 layered on top of post-v18
+ * hygiene fix + v18 walker. humanCategoryExploration now uses the exact
+ * Categories-panel locator + chevron selector from
+ * hand-scraper/scripts/expand_tree.js (battle-tested).
  *
- * Layout:
- *   1) multi_street_walker.js (v18 -- all-in no-descend + back-out chain collapse)
- *   2) scrape_helpers.js (v15)
- *   3) scrape_multistreet.js (post-v18 checkpoint-hygiene fix: fresh-launch
- *      state clear + flop emit order swap; v17 skip_flop_walk +
- *      emit_resume_file + chunk_max_raw_bytes + terminalFullyDone bug fix)
- *   4) scrape_resume.js (v15)
- *   5) post_reload_wizard.js (v15)
- *   6) combined_v17_extension.js (capsule helpers + __msEmitResumeFile
- *      with post-v18 flop-mismatch guard)
- *
- * Banner identifier kept for legacy bootstraps that grep for the string
- *   'hand-scraper-postflop-flop-turn v18'
- * (e.g. older SKILL.md probe text); this bundle is compatible with that
- * marker but contains the post-v18 checkpoint-hygiene fixes on top.
- *
- * hand-scraper-postflop-flop-turn v18 (+ checkpoint-hygiene fix)
+ * Banner identifier kept stable: bootstrap grep checks for
+ *   'hand-scraper-postflop-flop-turn'
  */
 
-/* ==================== 1) WALKER ==================== */
+/* ==================== 1) WALKER (+ phases 4+7) ==================== */
 /* multi_street_walker.js - DOM-only walker for the PLO Master Mind postflop trainer.
  *
  * Installs window.__W with primitives for DFS, modal handling, alias-aware card
@@ -145,14 +133,252 @@
     if (hi === 0) return 0;
     return lo + Math.floor(Math.random() * (hi - lo + 1));
   }
+  // PHASE 4: human-like primitives. All gated on window.__msHumanCfg; default off.
+  function _hcfg() { return window.__msHumanCfg || {}; }
+  function _hRange(name, defLo, defHi) {
+    const r = _hcfg()[name];
+    if (Array.isArray(r) && r.length === 2 && typeof r[0] === 'number' && typeof r[1] === 'number') return r;
+    return [defLo, defHi];
+  }
+  function _hPickInt(lo, hi) {
+    lo = Math.max(0, lo|0); hi = Math.max(lo, hi|0);
+    return lo + Math.floor(Math.random() * (hi - lo + 1));
+  }
+  function _hChance(name, def) {
+    const v = _hcfg()[name];
+    return (typeof v === 'number' && v >= 0 && v <= 1) ? v : def;
+  }
+
   async function interNodeWait() {
-    const ms = _nodeWaitMs();
+    let ms = _nodeWaitMs();
+    if (Math.random() < _hChance('long_pause_chance', 0)) {
+      const [lo, hi] = _hRange('long_pause_range_ms', 15000, 90000);
+      if (hi > 0) ms = _hPickInt(lo, hi);
+    }
     if (ms > 0) {
-      window.__msNodeWaitStats = window.__msNodeWaitStats || { count: 0, total_ms: 0, last_ms: 0 };
+      window.__msNodeWaitStats = window.__msNodeWaitStats || { count: 0, total_ms: 0, last_ms: 0, long_pauses: 0 };
       window.__msNodeWaitStats.count++;
       window.__msNodeWaitStats.total_ms += ms;
       window.__msNodeWaitStats.last_ms = ms;
+      if (ms >= 12000) window.__msNodeWaitStats.long_pauses++;
       await sleep(ms);
+    }
+  }
+
+  async function humanNodeBrowseHover(k) {
+    try {
+      const blocks = readBlocks();
+      if (!blocks.length) return 0;
+      const pool = blocks.slice();
+      const targets = [];
+      for (let i = 0; i < k && pool.length; i++) {
+        targets.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
+      }
+      for (const b of targets) {
+        const el = b.headerEl || b.blockEl;
+        if (!el) continue;
+        try {
+          el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true }));
+          el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, cancelable: true }));
+        } catch (_) {}
+        await sleep(200 + Math.floor(Math.random() * 600));
+      }
+      window.__msHumanStats = window.__msHumanStats || { node_hovers: 0, category_bursts: 0, turn_hovers: 0 };
+      window.__msHumanStats.node_hovers += targets.length;
+      return targets.length;
+    } catch (e) { return 0; }
+  }
+
+  // Cached Categories panel (re-located if missing or detached).
+  // Same logic as hand-scraper/scripts/expand_tree.js -- battle-tested.
+  function _msFindCategoriesPanel() {
+    if (window.__msCatPanel && document.contains(window.__msCatPanel)) {
+      return window.__msCatPanel;
+    }
+    let catLabel = null;
+    try {
+      catLabel = [...document.querySelectorAll('*')].find(
+        e => (e.textContent || '').trim() === 'Categories' && e.children.length === 0
+      );
+    } catch (_) {}
+    if (!catLabel) return null;
+    let panel = catLabel;
+    while (panel) {
+      const txt = panel.textContent || '';
+      if (txt.includes('Unpaired') && /\d+\.\d{2}%/.test(txt) && panel !== document.body) {
+        // Exclude the whole app shell (which also contains everything else)
+        let w = 9999;
+        try { w = panel.getBoundingClientRect().width; } catch (_) {}
+        if (w < 700) {
+          window.__msCatPanel = panel;
+          return panel;
+        }
+      }
+      panel = panel.parentElement;
+    }
+    return null;
+  }
+
+  // PHASE 4 (revised): humanCategoryExploration uses the exact panel locator +
+  // chevron selector from hand-scraper/scripts/expand_tree.js. Clicks random K
+  // chevron wrappers in the Categories panel (bottom-left). No /range/url
+  // calls. Caller's category_selector cfg knob can override the chevron
+  // selector if the trainer DOM changes later.
+  async function humanCategoryExploration(k) {
+    const cfg = _hcfg();
+    const panel = _msFindCategoriesPanel();
+    if (!panel) {
+      // Categories panel not found -- maybe the user is on a different tab
+      // (e.g. Reports). Quietly no-op rather than fall back to dangerous
+      // heuristics that might click trainer-state buttons.
+      return 0;
+    }
+    const chevronSel = cfg.category_selector || '.flex.size-4.shrink-0.items-center.cursor-pointer';
+    let chevrons = [];
+    try { chevrons = [...panel.querySelectorAll(chevronSel)]; } catch (_) { return 0; }
+    if (!chevrons.length) return 0;
+    const pool = chevrons.slice();
+    const targets = [];
+    for (let i = 0; i < k && pool.length; i++) {
+      targets.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
+    }
+    for (const el of targets) {
+      try {
+        el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+        await sleep(300 + Math.floor(Math.random() * 700));
+        el.click();                                   // expand
+        await sleep(3000 + Math.floor(Math.random() * 5000));  // "reading"
+        if (Math.random() < 0.5) {
+          el.click();                                 // collapse back
+          await sleep(500 + Math.floor(Math.random() * 1500));
+        }
+      } catch (_) {}
+    }
+    window.__msHumanStats = window.__msHumanStats || { node_hovers: 0, category_bursts: 0, turn_hovers: 0 };
+    window.__msHumanStats.category_bursts += targets.length;
+    return targets.length;
+  }
+
+  async function humanTurnBrowseHover(targetCard, k) {
+    try {
+      const cells = readModalCells('turn');
+      if (!cells.length) return 0;
+      const pool = cells.filter(c => c.card !== targetCard && c.status === 'ok');
+      if (!pool.length) return 0;
+      const picks = [];
+      const poolCopy = pool.slice();
+      for (let i = 0; i < k && poolCopy.length; i++) {
+        picks.push(poolCopy.splice(Math.floor(Math.random() * poolCopy.length), 1)[0]);
+      }
+      for (const cell of picks) {
+        if (!cell.el) continue;
+        try {
+          cell.el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true }));
+          cell.el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, cancelable: true }));
+        } catch (_) {}
+        await sleep(400 + Math.floor(Math.random() * 800));
+      }
+      window.__msHumanStats = window.__msHumanStats || { node_hovers: 0, category_bursts: 0, turn_hovers: 0 };
+      window.__msHumanStats.turn_hovers += picks.length;
+      return picks.length;
+    } catch (e) { return 0; }
+  }
+
+  // ------------------- PHASE 7: detectUnexpectedState -------------------
+  // Returns null if everything looks normal, else a {reason, detail} object.
+  // Caller (orchestrator) sets window.__msEmergencyStop = true on detection
+  // and aborts the run at the next safe boundary.
+  function detectUnexpectedState() {
+    try {
+      // Title check
+      const title = (document.title || "").trim();
+      if (!/PLO\s*(?:Master\s*Mind|Trainer)/i.test(title) && title.length > 0) {
+        return { reason: "title_mismatch", detail: { title } };
+      }
+      // URL check
+      const path = location.pathname;
+      const params = new URLSearchParams(location.search);
+      const isPostflop = (params.get("type") === "postflop") || /postflop/i.test(path);
+      if (!isPostflop) {
+        return { reason: "url_not_postflop", detail: { href: location.href } };
+      }
+      // Captcha / login indicators
+      const recaptcha = document.querySelector('iframe[src*="recaptcha"], iframe[src*="captcha"], div.g-recaptcha, [data-captcha]');
+      if (recaptcha) {
+        return { reason: "captcha_detected", detail: { tag: recaptcha.tagName } };
+      }
+      // "Sign in" / "Log in" buttons appearing in body (heuristic)
+      const loginBtns = $$('button,a').filter(el => /\b(sign\s*in|log\s*in|login|signin)\b/i.test((el.textContent||"").trim()));
+      if (loginBtns.length > 0 && !document.querySelector('[data-app-loaded]') ) {
+        // Only flag if the trainer's main panel ISN'T visible
+        const trainerVisible = readBlocks().length > 0 || $$('.bg-neutral-950.px-2').length > 0;
+        if (!trainerVisible) {
+          return { reason: "login_required", detail: { n_login_buttons: loginBtns.length } };
+        }
+      }
+      // HTTP 4xx/5xx on /range/url tracked elsewhere; just check sticky flag.
+      if (window.__msUnexpectedHttp) {
+        return { reason: "http_error", detail: window.__msUnexpectedHttp };
+      }
+    } catch (e) {
+      return { reason: "detect_exception", detail: { message: e.message } };
+    }
+    return null;
+  }
+
+  // ------------------- PHASE 7: emitEmergencyStopFile -------------------
+  // Browser Blob download. Same approach as resume.json files. The cron
+  // pre-flight uses merge_resumes.py check-emergency-stop, which reads
+  // <device>.active in the ingest folder once the file is moved.
+  function emitEmergencyStopFile(payload) {
+    try {
+      const dev = (window.__msHumanCfg && window.__msHumanCfg.device_name) ||
+                  (window.__msLaunchCfg && window.__msLaunchCfg.device_name) || 'unknown';
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      // Two file emits: a timestamped detail file + a sentinel.
+      const detail = Object.assign({
+        ts: new Date().toISOString(), device: dev,
+        url: location.href, page_title: document.title,
+      }, payload || {});
+      const detailName  = `${dev}_${ts}.emergencystop.json`;
+      const sentinelName = `${dev}.active.emergencystop.json`;
+      for (const [name, body] of [[detailName, detail], [sentinelName, detail]]) {
+        try {
+          const blob = new Blob([JSON.stringify(body, null, 2)], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url; a.download = name;
+          document.body.appendChild(a); a.click();
+          setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 1000);
+        } catch (e) {
+          console.warn('[hand-scraper phase7] emitEmergencyStopFile failed for', name, e && e.message);
+        }
+      }
+      console.warn('[hand-scraper phase7] EMERGENCY STOP emitted:', detail);
+    } catch (_) {}
+  }
+
+  let _humanNodeCount = 0;
+  let _humanNextCategoryAt = null;
+  let _humanNextNodeBrowseAt = null;
+  function _humanNextInterval(rangeName) {
+    const [lo, hi] = _hRange(rangeName, 0, 0);
+    if (lo <= 0 || hi <= 0) return null;
+    return _hPickInt(lo, hi);
+  }
+  async function maybeHumanLikeNoiseBetweenNodes() {
+    _humanNodeCount++;
+    if (_humanNextCategoryAt === null) _humanNextCategoryAt = _humanNextInterval('category_every_n_range');
+    if (_humanNextNodeBrowseAt === null) _humanNextNodeBrowseAt = _humanNextInterval('node_hover_every_n_range');
+    if (_humanNextCategoryAt !== null && _humanNodeCount >= _humanNextCategoryAt) {
+      const k = _hPickInt(..._hRange('category_count_range', 1, 2));
+      if (k > 0) await humanCategoryExploration(k);
+      _humanNextCategoryAt = _humanNodeCount + (_humanNextInterval('category_every_n_range') || 0);
+    }
+    if (_humanNextNodeBrowseAt !== null && _humanNodeCount >= _humanNextNodeBrowseAt) {
+      const k = _hPickInt(..._hRange('node_hover_count_range', 1, 3));
+      if (k > 0) await humanNodeBrowseHover(k);
+      _humanNextNodeBrowseAt = _humanNodeCount + (_humanNextInterval('node_hover_every_n_range') || 0);
     }
   }
 
@@ -395,6 +621,7 @@
   async function dfsStreet(state, walkResult, opts = {}) {
     // v15: random 3-5s inter-node wait at the start of every node visit.
     // Configurable via window.__msNodeWaitMin / window.__msNodeWaitMax.
+    await maybeHumanLikeNoiseBetweenNodes();
     await interNodeWait();
     // Auto-init streetEntryNode on first call into a street.
     if (state.streetEntryNode === undefined) state.streetEntryNode = state.node || '';
@@ -490,7 +717,8 @@
       // capture for N-A is made by the click above, so range data for the
       // post-All-in spot is fully preserved.
       if (pickIsAllIn) {
-        await interNodeWait();
+        await maybeHumanLikeNoiseBetweenNodes();
+    await interNodeWait();
         const abAllIn = await waitForActionPanelStable(4000, 500);
         if (!abAllIn || abAllIn.actions.length === 0) {
           walkResult.warnings.push(`all-in node ${childPath}: no stable action panel after click (capture may still be valid)`);
@@ -705,9 +933,15 @@
     pickCardCommit, listCanonicalCards,
     waitForActionPanelStable,
     interNodeWait,
+    humanNodeBrowseHover, humanCategoryExploration, humanTurnBrowseHover,
+    maybeHumanLikeNoiseBetweenNodes,
+    // PHASE 7
+    detectUnexpectedState, emitEmergencyStopFile,
   };
   window.__msV18WalkerInstalled = true;
-  return 'multi-street walker installed (window.__W) [v18 all-in no-descend + back-out chain collapse; v15 random 3-5s inter-node wait; v13 plomm envelope support; v11 dynamic bet sizings + 1/5 pot static]';
+  window.__msPhase4HumanLikeInstalled = true;
+  window.__msPhase7SafetyInstalled = true;
+  return 'multi-street walker installed (window.__W) [phase 7 safety detect + emergency stop emit; phase 4 human-like noise (long pauses + hover bursts + category exploration); v18 all-in no-descend + back-out chain collapse; v15 random 3-5s inter-node wait; v13 plomm envelope support; v11 dynamic bet sizings + 1/5 pot static]';
 })();
 /* ==================== 2) HELPERS ==================== */
 /* scrape_helpers.js - Interceptors, binary blob decoder, per-node CSV+meta
@@ -1368,7 +1602,7 @@
   };
   return 'multi-street helpers installed (window.__msHelpers) [v15 banner-only republish; v14 labelToTypeSize static-map fix; v13 plomm envelope support; v11 dynamic bet sizings]';
 })();
-/* ==================== 3) ORCHESTRATOR v17 ==================== */
+/* ==================== 3) ORCHESTRATOR + __scrapeSession + safety ==================== */
 /* scrape_multistreet.js - flop+turn tree scraper for the PLO Master Mind
  * postflop trainer. Walks (flop -> every canonical turn under every flop
  * terminal), captures /range/url envelopes, decodes binary/plomm blobs,
@@ -1669,7 +1903,35 @@
     if (typeof cfg.node_wait_min_ms === 'number') window.__msNodeWaitMin = cfg.node_wait_min_ms;
     if (typeof cfg.node_wait_max_ms === 'number') window.__msNodeWaitMax = cfg.node_wait_max_ms;
     // v15: turn-cards-per-chunk threshold (default 5).
-    const turnCardsPerChunk = (typeof cfg.turn_cards_per_chunk === 'number' && cfg.turn_cards_per_chunk > 0) ? cfg.turn_cards_per_chunk : 5;
+    let   turnCardsPerChunk = (typeof cfg.turn_cards_per_chunk === 'number' && cfg.turn_cards_per_chunk > 0) ? cfg.turn_cards_per_chunk : 5;
+    // PHASE 1 (session mode): per-card zip + resume.json naming.
+    //   zip_per_card  forces turnCardsPerChunk = 1 so every chunk-emit is
+    //                 exactly one card (atomic per-card output).
+    //   device_name   string identifying the device (lives only inside the
+    //                 resume.json filename + payload, NOT in the zip name --
+    //                 zip names stay clean: <tree>_<flop>_<terminal>_<card>.zip).
+    //   session_id    string tagging this run; appears inside the resume.json
+    //                 payload + run log entries.
+    const zipPerCard = cfg.zip_per_card === true;
+    const deviceName = (typeof cfg.device_name === 'string' && cfg.device_name.length > 0) ? cfg.device_name : null;
+    const sessionId  = (typeof cfg.session_id  === 'string' && cfg.session_id.length  > 0) ? cfg.session_id  : null;
+    if (zipPerCard) { turnCardsPerChunk = 1; }
+    // PHASE 2: optional explicit card targets per terminal. When provided
+    //   for a terminal, the walker visits ONLY those cards, in the order
+    //   given. Caller (planner) typically pre-shuffles. When absent for
+    //   a terminal, the existing top-to-bottom DOM order is used.
+    //   Shape: { 'C-R50-C': ['Qs','9s','Td'], 'R66-C': ['As'], ... }
+    const targetCardsPerTerminal = (cfg.target_cards_per_terminal && typeof cfg.target_cards_per_terminal === 'object')
+      ? cfg.target_cards_per_terminal
+      : null;
+    // PHASE 4: human-like noise cfg. Default null -> all off. When provided,
+    //   gets exported to window.__msHumanCfg for the walker to read.
+    if (cfg.human_like && typeof cfg.human_like === 'object') {
+      window.__msHumanCfg = Object.assign({}, cfg.human_like);
+    } else {
+      window.__msHumanCfg = window.__msHumanCfg || {};
+    }
+    const humanCfg = window.__msHumanCfg;
     // v15: auto-continue defaults to false → orchestrator pauses after each zip.
     const autoContinue = cfg.auto_continue === true;
     // v17: byte-size OR trigger — flush chunk when raw bytes >= this many,
@@ -1733,6 +1995,10 @@
       started_at: new Date().toISOString(),
       nodes: [], warnings: [], events: [], aliases: [],
       summary: {}, zips: [],
+      // PHASE 2: card map captured at first turn-modal open per terminal.
+      //   Shape: { [terminal]: {recorded_at, recorded_by_device, total_cells,
+      //                         available: [...], used: [...], dim_dom: [...]} }
+      terminal_card_maps: {},
     };
     const log = (kind, data) => result.events.push({ ts: Date.now(), kind, ...(data || {}) });
     const flop = result.flop;
@@ -1762,6 +2028,8 @@
         completed_cards_per_terminal: Object.fromEntries(
           Object.entries(completedCardsPerTerminal).map(([k, v]) => [k, v.slice()])
         ),
+        // PHASE 2: card map snapshots collected at first per-terminal open.
+        terminal_card_maps: Object.assign({}, result.terminal_card_maps || {}),
         aliases: result.aliases.slice(),
         zips_emitted: result.zips.map(z => ({
           kind: z.kind, name: z.name,
@@ -1984,7 +2252,16 @@
         async function flushChunk(reason) {
           if (chunkState.files.length === 0) return null;
           const idxStr = String(chunkState.chunkIndex).padStart(3, '0');
-          const chunkZipName = `${result.tree}_${result.flop}_${ft.terminal_node}_turn_chunk${idxStr}.zip`;
+          // PHASE 1: zip name pattern depends on zipPerCard mode.
+          //   Off (legacy): <tree>_<flop>_<terminal>_turn_chunk<NNN>.zip
+          //   On  (per-card): <tree>_<flop>_<terminal>_<turn_card>.zip
+          // Capture card name BEFORE the chunk reset later in this function.
+          const cardForName = (zipPerCard && chunkState.contents[0] && chunkState.contents[0].turn_card)
+            ? chunkState.contents[0].turn_card
+            : null;
+          const chunkZipName = (zipPerCard && cardForName)
+            ? `${result.tree}_${result.flop}_${ft.terminal_node}_${cardForName}.zip`
+            : `${result.tree}_${result.flop}_${ft.terminal_node}_turn_chunk${idxStr}.zip`;
           const chunkManifest = {
             tree: result.tree, flop: result.flop, scope, chipsPerBb,
             segment_kind: 'turn_card_chunk',
@@ -2036,11 +2313,29 @@
           chunkState.contents = [];
           // v15: checkpoint + pause after each chunk zip.
           saveCheckpoint(buildCheckpoint({ last_event: 'turn_chunk_emitted', last_zip: chunkZipName, last_terminal: ft.terminal_node }));
-          // v17: emit resume.json alongside the chunk zip
+          // v17 + PHASE 1: emit resume.json alongside the chunk zip.
+          //   Legacy: event = `after_<terminal>_chunk<NNN>`; flat filename.
+          //   Phase 1 (zipPerCard): event = `after_<terminal>_<card>`; filename
+          //   becomes `<tree>_<flop>_<terminal>_<card>_<device>_resume.json` and
+          //   the JSON payload is augmented with device/session_id/session_meta.
           if (emitResumeFile && typeof window.__msEmitResumeFile === 'function') {
             try {
               const safeFt = ft.terminal_node.replace(/[^A-Za-z0-9_-]/g, '_');
-              await window.__msEmitResumeFile(`after_${safeFt}_chunk${idxStr}`, downloadDelayMs);
+              if (zipPerCard && cardForName) {
+                await window.__msEmitResumeFile(
+                  `after_${safeFt}_${cardForName}`,
+                  downloadDelayMs,
+                  {
+                    zip_per_card: true,
+                    terminal: ft.terminal_node,
+                    card: cardForName,
+                    device: deviceName,
+                    session_id: sessionId,
+                  }
+                );
+              } else {
+                await window.__msEmitResumeFile(`after_${safeFt}_chunk${idxStr}`, downloadDelayMs);
+              }
             } catch (e) {
               result.warnings.push(`emit_resume_file (chunk ${chunkZipName}) failed: ${e.message}`);
             }
@@ -2304,6 +2599,28 @@
             log('quota_or_user_abort', { phase: 'cell_loop', terminal: ft.terminal_node });
             break;
           }
+          // PHASE 7: safety detection at safe boundary.
+          //   If unexpected state (captcha, login redirect, page change),
+          //   emit emergency-stop file + abort the run gracefully.
+          if (typeof W.detectUnexpectedState === 'function' && !window.__msEmergencyStop) {
+            const bad = W.detectUnexpectedState();
+            if (bad) {
+              window.__msEmergencyStop = true;
+              window.__msAborted = true;
+              terminalExitReason = 'emergency_stop';
+              try {
+                W.emitEmergencyStopFile({
+                  device: cfg.device_name || null,
+                  session_id: cfg.session_id || null,
+                  tree: result.tree, flop: result.flop, terminal: ft.terminal_node,
+                  reason: bad.reason, detail: bad.detail,
+                });
+              } catch (_) {}
+              result.warnings.push(`EMERGENCY STOP: ${bad.reason} -- check Drive emergency_stops/ and clear <device>.active.emergencystop.json to resume`);
+              log('emergency_stop', { terminal: ft.terminal_node, reason: bad.reason });
+              break outer;
+            }
+          }
           if (canonicalsWalkedThisTerminal >= turnCardLimit) { terminalExitReason = 'turn_card_limit'; break; }
           if (W.modalKind() !== 'turn') {
             const er = await ensureTurnModalAtTerminal();
@@ -2314,9 +2631,45 @@
           }
           await W.dismissNoSimPopupIfAny();
           const cells = W.readModalCells('turn');
+
+          // PHASE 2: capture full card map once per terminal (first cell read).
+          //   Drives state/card_maps/<tree>/<flop>/<terminal>.json downstream
+          //   so other devices/sessions can pick cards without re-inspecting.
+          if (!result.terminal_card_maps[ft.terminal_node]) {
+            result.terminal_card_maps[ft.terminal_node] = {
+              recorded_at: new Date().toISOString(),
+              recorded_by_device: deviceName || null,
+              recorded_by_session: sessionId || null,
+              total_cells: cells.length,
+              available: cells.filter(c => c.status === 'ok').map(c => c.card),
+              used:      cells.filter(c => c.status === 'used').map(c => c.card),
+              dim_dom:   cells.filter(c => c.status === 'dim').map(c => c.card),
+            };
+            log('terminal_card_map_captured', {
+              terminal: ft.terminal_node,
+              n_available: result.terminal_card_maps[ft.terminal_node].available.length,
+              n_used:      result.terminal_card_maps[ft.terminal_node].used.length,
+              n_dim_dom:   result.terminal_card_maps[ft.terminal_node].dim_dom.length,
+            });
+          }
+
+          // PHASE 2: target-cards-aware cell pick.
+          //   With targetCardsPerTerminal[terminal] provided: iterate the
+          //   given list in order, pick the first card that maps to an
+          //   available cell. Aliased/dim cards are recorded as alias-hits
+          //   and skipped (consistent with legacy behavior).
+          //   Without: fall back to legacy top-to-bottom DOM order.
           let target = null;
-          for (const c of cells) {
-            if (visitedThisTerminal.has(c.card)) continue;
+          const targetList = (targetCardsPerTerminal && Array.isArray(targetCardsPerTerminal[ft.terminal_node]))
+            ? targetCardsPerTerminal[ft.terminal_node]
+            : null;
+          const cellByCard = new Map(cells.map(c => [c.card, c]));
+          const iterCards = targetList ? targetList : cells.map(c => c.card);
+
+          for (const wantedCard of iterCards) {
+            if (visitedThisTerminal.has(wantedCard)) continue;
+            const c = cellByCard.get(wantedCard);
+            if (!c) continue;                 // wanted card not in modal (e.g. typo)
             if (c.status === 'used') continue;
             if (knownAliases.has(c.card) || knownDim.has(c.card)) {
               visitedThisTerminal.add(c.card);
@@ -2342,6 +2695,18 @@
             break outer;
           }
           visitedThisTerminal.add(target.card);
+          // PHASE 4: hover 1-3 sibling cards before committing to target.
+          //   No clicks -> no /range/url. Gated on cfg.human_like.turn_hover_count_range.
+          try {
+            const hr = humanCfg && humanCfg.turn_hover_count_range;
+            if (Array.isArray(hr) && hr.length === 2 && hr[1] > 0) {
+              const lo = Math.max(0, hr[0]|0), hi = Math.max(lo, hr[1]|0);
+              const k = lo + Math.floor(Math.random() * (hi - lo + 1));
+              if (k > 0 && typeof W.humanTurnBrowseHover === 'function') {
+                await W.humanTurnBrowseHover(target.card, k);
+              }
+            }
+          } catch (_) {}
           const verdict = await handleOneCell(target.card, target.status);
           if (verdict === 'break') break outer;
         }
@@ -2413,7 +2778,103 @@
   };
 
   window.__msCheckpointHygieneFixed = true;
-  return 'multi-street scraper installed (window.__scrapeMultiStreet) [post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + emit_resume_file + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
+  window.__msPhase1SessionModeInstalled = true;
+  window.__msPhase2CardMapsInstalled = true;
+  window.__msPhase3SessionWrapperInstalled = true;
+  window.__msPhase4OrchestratorWiredInstalled = true;
+  window.__msPhase7EmergencyHookInstalled = true;
+
+  // ---------------------------------------------------------------------
+  // PHASE 3: __scrapeSession -- convenience wrapper for the multi-device
+  // session workflow. Takes a session spec produced by build_plan.py:
+  //
+  //   {
+  //     tree: 'PLO5C_100_2_SB_BB_3BP',
+  //     flop: 'Js8c2h',
+  //     terminal: 'C-R50-C',
+  //     cards: ['Qs','9s','Td'],          // walked in this order
+  //     device: 'main',
+  //     session_id: '9e3d-...-fa1b',
+  //     cached_flop_terminals: [...],     // from ledger (Phase 1)
+  //   }
+  //
+  // Plus optional overrides:
+  //   {
+  //     auto_continue: true,              // default true for sessions
+  //     node_wait_min_ms / node_wait_max_ms,
+  //     download_delay_ms,
+  //     ...any other cfg knob accepted by __scrapeMultiStreet
+  //   }
+  //
+  // Builds the right cfg for __scrapeMultiStreet:
+  //   - zip_per_card: true (Phase 1)
+  //   - skip_flop_walk: true + cached_flop_terminals (Phase 1, no flop re-walk)
+  //   - flop_terminal_filter: walks only the target terminal
+  //   - target_cards_per_terminal: only the listed cards, in given order (Phase 2)
+  //   - turn_card_limit: cards.length (safety belt)
+  //
+  // Returns the __scrapeMultiStreet result, with session_summary appended.
+  // ---------------------------------------------------------------------
+  if (typeof window.__scrapeSession !== 'function') {
+    window.__scrapeSession = async function(spec) {
+      spec = spec || {};
+      if (!spec.tree || !spec.flop || !spec.terminal) {
+        throw new Error('__scrapeSession: spec.tree, spec.flop, spec.terminal are required');
+      }
+      if (!Array.isArray(spec.cards) || spec.cards.length === 0) {
+        throw new Error('__scrapeSession: spec.cards must be a non-empty array');
+      }
+      if (!spec.cached_flop_terminals || !spec.cached_flop_terminals.length) {
+        throw new Error('__scrapeSession: spec.cached_flop_terminals is required (read from ledger)');
+      }
+      const cfg = Object.assign({
+        scope: 'flop+turn',
+        zip_per_card: true,
+        auto_continue: true,
+      }, spec.cfg_overrides || {});
+      cfg.device_name = spec.device || cfg.device_name;
+      cfg.session_id  = spec.session_id || cfg.session_id;
+      cfg.skip_flop_walk = true;
+      cfg.cached_flop_terminals = spec.cached_flop_terminals;
+      cfg.flop_terminal_filter = (function(targetTerm) {
+        return function(t) { return t === targetTerm; };
+      })(spec.terminal);
+      cfg.target_cards_per_terminal = Object.assign(
+        {},
+        cfg.target_cards_per_terminal || {},
+        { [spec.terminal]: spec.cards.slice() }
+      );
+      cfg.turn_card_limit = spec.cards.length;
+      const sessionStartedAt = new Date().toISOString();
+      try { console.log('[hand-scraper phase3] __scrapeSession launching', {
+        tree: spec.tree, flop: spec.flop, terminal: spec.terminal,
+        cards: spec.cards, device: cfg.device_name, session_id: cfg.session_id
+      }); } catch (_) {}
+      const result = await window.__scrapeMultiStreet(cfg);
+      result.session_summary = {
+        session_id: cfg.session_id || null,
+        device: cfg.device_name || null,
+        tree: spec.tree,
+        flop: spec.flop,
+        terminal: spec.terminal,
+        cards_planned: spec.cards.slice(),
+        cards_walked: (result.zips || [])
+          .filter(z => z.kind === 'turn_card_chunk' && Array.isArray(z.turn_cards))
+          .reduce((acc, z) => acc.concat(z.turn_cards), []),
+        zips_emitted: (result.zips || []).map(z => z.name),
+        captures: result.summary && result.summary.captures,
+        started_at: sessionStartedAt,
+        finished_at: result.finished_at,
+        elapsed_s: result.elapsed_s,
+        aborted_by_user: !!result.aborted_by_user,
+        aborted_due_to_quota: !!result.aborted_due_to_quota,
+      };
+      window.__msSessionResult = result;
+      return result;
+    };
+  }
+
+  return 'multi-street scraper installed (window.__scrapeMultiStreet, window.__scrapeSession) [phase 7 emergency-stop hook; phase 4 human-like noise wired (cfg.human_like -> window.__msHumanCfg + turn hover hook); phase 3 session wrapper; phase 2 card maps + target_cards_per_terminal; phase 1 session mode (zip_per_card + device_name + session_id); post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + emit_resume_file + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
 })();
 
 /* ==================== 4) RESUME ==================== */
@@ -3580,6 +4041,8 @@
           Object.entries(ckpt.completed_cards_per_terminal || {}).map(([k, v]) => [k, v.slice()])
         ),
         next_chunk_index_per_terminal: Object.assign({}, ckpt.next_chunk_index_per_terminal || {}),
+        // PHASE 2: surface terminal card maps (full data already in checkpoint.terminal_card_maps).
+        terminal_card_maps_terminals: ckpt.terminal_card_maps ? Object.keys(ckpt.terminal_card_maps) : [],
         zips_emitted: (ckpt.zips_emitted || []).map(z => z.name),
         last_event: ckpt.extra && ckpt.extra.last_event,
         terminal_exit_reason: ckpt.extra && ckpt.extra.terminal_exit_reason,
@@ -3604,15 +4067,15 @@
   //    <tree>_<flop>_resume_<eventLabel>.json containing the current capsule.
   //    Called automatically by the v17 orchestrator after every zip emit.
   // ---------------------------------------------------------------------
-  window.__msEmitResumeFile = async function(eventLabel, downloadDelayMs) {
+  window.__msEmitResumeFile = async function(eventLabel, downloadDelayMs, opts) {
     eventLabel = eventLabel || 'manual';
+    opts = opts || {};
     const safeLabel = String(eventLabel).replace(/[^A-Za-z0-9_-]/g, '_');
     downloadDelayMs = (typeof downloadDelayMs === 'number') ? downloadDelayMs : 250;
 
-    const capsuleStr = window.__msDumpResumeCapsule({ silent: true });
-    const capsule = JSON.parse(capsuleStr);
-    const tree = (capsule.checkpoint && capsule.checkpoint.tree) || 'UNKNOWN_TREE';
-    const flop = (capsule.checkpoint && capsule.checkpoint.flop) || 'UNKNOWN_FLOP';
+    const capsuleObj = JSON.parse(window.__msDumpResumeCapsule({ silent: true }));
+    const tree = (capsuleObj.checkpoint && capsuleObj.checkpoint.tree) || 'UNKNOWN_TREE';
+    const flop = (capsuleObj.checkpoint && capsuleObj.checkpoint.flop) || 'UNKNOWN_FLOP';
 
     // POST-v18 BUG FIX (flop-mismatch guard): if the in-memory checkpoint's
     //   flop disagrees with the URL's flop, the capsule is carrying stale
@@ -3629,7 +4092,29 @@
       throw err;
     }
 
-    const fileName = `${tree}_${flop}_resume_${safeLabel}.json`;
+    // PHASE 1: per-card naming when opts identifies a single (terminal, card)
+    //   in zip_per_card mode. JSON payload also gets device + session_id +
+    //   session_meta so downstream tooling can attribute the capsule without
+    //   re-parsing the filename.
+    let fileName;
+    if (opts.zip_per_card && opts.terminal && opts.card) {
+      const safeTerm = String(opts.terminal).replace(/[^A-Za-z0-9_-]/g, '_');
+      const safeCard = String(opts.card).replace(/[^A-Za-z0-9_-]/g, '_');
+      const safeDev  = String(opts.device || 'unknown').replace(/[^A-Za-z0-9_-]/g, '_');
+      fileName = `${tree}_${flop}_${safeTerm}_${safeCard}_${safeDev}_resume.json`;
+      capsuleObj.device = opts.device || null;
+      capsuleObj.session_id = opts.session_id || null;
+      capsuleObj.session_emitted_at = new Date().toISOString();
+      capsuleObj.session_meta = {
+        terminal: opts.terminal,
+        card: opts.card,
+        device: opts.device || null,
+        session_id: opts.session_id || null,
+      };
+    } else {
+      fileName = `${tree}_${flop}_resume_${safeLabel}.json`;
+    }
+    const capsuleStr = JSON.stringify(capsuleObj, null, 2);
 
     try {
       const blob = new Blob([capsuleStr], { type: 'application/json' });
@@ -3776,6 +4261,8 @@
 
   window.__msV17ExtensionInstalled = true;
   window.__msResumeFileFlopGuardInstalled = true;
+  window.__msPhase1ResumeFileOptsInstalled = true;
+  window.__msPhase2CapsuleSummaryInstalled = true;
   try {
     console.log('[hand-scraper v17] capsule extension installed (__msDumpResumeCapsule, __msApplyResumeCapsule, __msEmitResumeFile + post-v18 flop-mismatch guard). Pauses still come from v15; Claude must NEVER auto-continue them.');
   } catch (_) {}

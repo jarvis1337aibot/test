@@ -121,14 +121,252 @@
     if (hi === 0) return 0;
     return lo + Math.floor(Math.random() * (hi - lo + 1));
   }
+  // PHASE 4: human-like primitives. All gated on window.__msHumanCfg; default off.
+  function _hcfg() { return window.__msHumanCfg || {}; }
+  function _hRange(name, defLo, defHi) {
+    const r = _hcfg()[name];
+    if (Array.isArray(r) && r.length === 2 && typeof r[0] === 'number' && typeof r[1] === 'number') return r;
+    return [defLo, defHi];
+  }
+  function _hPickInt(lo, hi) {
+    lo = Math.max(0, lo|0); hi = Math.max(lo, hi|0);
+    return lo + Math.floor(Math.random() * (hi - lo + 1));
+  }
+  function _hChance(name, def) {
+    const v = _hcfg()[name];
+    return (typeof v === 'number' && v >= 0 && v <= 1) ? v : def;
+  }
+
   async function interNodeWait() {
-    const ms = _nodeWaitMs();
+    let ms = _nodeWaitMs();
+    if (Math.random() < _hChance('long_pause_chance', 0)) {
+      const [lo, hi] = _hRange('long_pause_range_ms', 15000, 90000);
+      if (hi > 0) ms = _hPickInt(lo, hi);
+    }
     if (ms > 0) {
-      window.__msNodeWaitStats = window.__msNodeWaitStats || { count: 0, total_ms: 0, last_ms: 0 };
+      window.__msNodeWaitStats = window.__msNodeWaitStats || { count: 0, total_ms: 0, last_ms: 0, long_pauses: 0 };
       window.__msNodeWaitStats.count++;
       window.__msNodeWaitStats.total_ms += ms;
       window.__msNodeWaitStats.last_ms = ms;
+      if (ms >= 12000) window.__msNodeWaitStats.long_pauses++;
       await sleep(ms);
+    }
+  }
+
+  async function humanNodeBrowseHover(k) {
+    try {
+      const blocks = readBlocks();
+      if (!blocks.length) return 0;
+      const pool = blocks.slice();
+      const targets = [];
+      for (let i = 0; i < k && pool.length; i++) {
+        targets.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
+      }
+      for (const b of targets) {
+        const el = b.headerEl || b.blockEl;
+        if (!el) continue;
+        try {
+          el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true }));
+          el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, cancelable: true }));
+        } catch (_) {}
+        await sleep(200 + Math.floor(Math.random() * 600));
+      }
+      window.__msHumanStats = window.__msHumanStats || { node_hovers: 0, category_bursts: 0, turn_hovers: 0 };
+      window.__msHumanStats.node_hovers += targets.length;
+      return targets.length;
+    } catch (e) { return 0; }
+  }
+
+  // Cached Categories panel (re-located if missing or detached).
+  // Same logic as hand-scraper/scripts/expand_tree.js -- battle-tested.
+  function _msFindCategoriesPanel() {
+    if (window.__msCatPanel && document.contains(window.__msCatPanel)) {
+      return window.__msCatPanel;
+    }
+    let catLabel = null;
+    try {
+      catLabel = [...document.querySelectorAll('*')].find(
+        e => (e.textContent || '').trim() === 'Categories' && e.children.length === 0
+      );
+    } catch (_) {}
+    if (!catLabel) return null;
+    let panel = catLabel;
+    while (panel) {
+      const txt = panel.textContent || '';
+      if (txt.includes('Unpaired') && /\d+\.\d{2}%/.test(txt) && panel !== document.body) {
+        // Exclude the whole app shell (which also contains everything else)
+        let w = 9999;
+        try { w = panel.getBoundingClientRect().width; } catch (_) {}
+        if (w < 700) {
+          window.__msCatPanel = panel;
+          return panel;
+        }
+      }
+      panel = panel.parentElement;
+    }
+    return null;
+  }
+
+  // PHASE 4 (revised): humanCategoryExploration uses the exact panel locator +
+  // chevron selector from hand-scraper/scripts/expand_tree.js. Clicks random K
+  // chevron wrappers in the Categories panel (bottom-left). No /range/url
+  // calls. Caller's category_selector cfg knob can override the chevron
+  // selector if the trainer DOM changes later.
+  async function humanCategoryExploration(k) {
+    const cfg = _hcfg();
+    const panel = _msFindCategoriesPanel();
+    if (!panel) {
+      // Categories panel not found -- maybe the user is on a different tab
+      // (e.g. Reports). Quietly no-op rather than fall back to dangerous
+      // heuristics that might click trainer-state buttons.
+      return 0;
+    }
+    const chevronSel = cfg.category_selector || '.flex.size-4.shrink-0.items-center.cursor-pointer';
+    let chevrons = [];
+    try { chevrons = [...panel.querySelectorAll(chevronSel)]; } catch (_) { return 0; }
+    if (!chevrons.length) return 0;
+    const pool = chevrons.slice();
+    const targets = [];
+    for (let i = 0; i < k && pool.length; i++) {
+      targets.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
+    }
+    for (const el of targets) {
+      try {
+        el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+        await sleep(300 + Math.floor(Math.random() * 700));
+        el.click();                                   // expand
+        await sleep(3000 + Math.floor(Math.random() * 5000));  // "reading"
+        if (Math.random() < 0.5) {
+          el.click();                                 // collapse back
+          await sleep(500 + Math.floor(Math.random() * 1500));
+        }
+      } catch (_) {}
+    }
+    window.__msHumanStats = window.__msHumanStats || { node_hovers: 0, category_bursts: 0, turn_hovers: 0 };
+    window.__msHumanStats.category_bursts += targets.length;
+    return targets.length;
+  }
+
+  async function humanTurnBrowseHover(targetCard, k) {
+    try {
+      const cells = readModalCells('turn');
+      if (!cells.length) return 0;
+      const pool = cells.filter(c => c.card !== targetCard && c.status === 'ok');
+      if (!pool.length) return 0;
+      const picks = [];
+      const poolCopy = pool.slice();
+      for (let i = 0; i < k && poolCopy.length; i++) {
+        picks.push(poolCopy.splice(Math.floor(Math.random() * poolCopy.length), 1)[0]);
+      }
+      for (const cell of picks) {
+        if (!cell.el) continue;
+        try {
+          cell.el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true }));
+          cell.el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, cancelable: true }));
+        } catch (_) {}
+        await sleep(400 + Math.floor(Math.random() * 800));
+      }
+      window.__msHumanStats = window.__msHumanStats || { node_hovers: 0, category_bursts: 0, turn_hovers: 0 };
+      window.__msHumanStats.turn_hovers += picks.length;
+      return picks.length;
+    } catch (e) { return 0; }
+  }
+
+  // ------------------- PHASE 7: detectUnexpectedState -------------------
+  // Returns null if everything looks normal, else a {reason, detail} object.
+  // Caller (orchestrator) sets window.__msEmergencyStop = true on detection
+  // and aborts the run at the next safe boundary.
+  function detectUnexpectedState() {
+    try {
+      // Title check
+      const title = (document.title || "").trim();
+      if (!/PLO\s*(?:Master\s*Mind|Trainer)/i.test(title) && title.length > 0) {
+        return { reason: "title_mismatch", detail: { title } };
+      }
+      // URL check
+      const path = location.pathname;
+      const params = new URLSearchParams(location.search);
+      const isPostflop = (params.get("type") === "postflop") || /postflop/i.test(path);
+      if (!isPostflop) {
+        return { reason: "url_not_postflop", detail: { href: location.href } };
+      }
+      // Captcha / login indicators
+      const recaptcha = document.querySelector('iframe[src*="recaptcha"], iframe[src*="captcha"], div.g-recaptcha, [data-captcha]');
+      if (recaptcha) {
+        return { reason: "captcha_detected", detail: { tag: recaptcha.tagName } };
+      }
+      // "Sign in" / "Log in" buttons appearing in body (heuristic)
+      const loginBtns = $$('button,a').filter(el => /\b(sign\s*in|log\s*in|login|signin)\b/i.test((el.textContent||"").trim()));
+      if (loginBtns.length > 0 && !document.querySelector('[data-app-loaded]') ) {
+        // Only flag if the trainer's main panel ISN'T visible
+        const trainerVisible = readBlocks().length > 0 || $$('.bg-neutral-950.px-2').length > 0;
+        if (!trainerVisible) {
+          return { reason: "login_required", detail: { n_login_buttons: loginBtns.length } };
+        }
+      }
+      // HTTP 4xx/5xx on /range/url tracked elsewhere; just check sticky flag.
+      if (window.__msUnexpectedHttp) {
+        return { reason: "http_error", detail: window.__msUnexpectedHttp };
+      }
+    } catch (e) {
+      return { reason: "detect_exception", detail: { message: e.message } };
+    }
+    return null;
+  }
+
+  // ------------------- PHASE 7: emitEmergencyStopFile -------------------
+  // Browser Blob download. Same approach as resume.json files. The cron
+  // pre-flight uses merge_resumes.py check-emergency-stop, which reads
+  // <device>.active in the ingest folder once the file is moved.
+  function emitEmergencyStopFile(payload) {
+    try {
+      const dev = (window.__msHumanCfg && window.__msHumanCfg.device_name) ||
+                  (window.__msLaunchCfg && window.__msLaunchCfg.device_name) || 'unknown';
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      // Two file emits: a timestamped detail file + a sentinel.
+      const detail = Object.assign({
+        ts: new Date().toISOString(), device: dev,
+        url: location.href, page_title: document.title,
+      }, payload || {});
+      const detailName  = `${dev}_${ts}.emergencystop.json`;
+      const sentinelName = `${dev}.active.emergencystop.json`;
+      for (const [name, body] of [[detailName, detail], [sentinelName, detail]]) {
+        try {
+          const blob = new Blob([JSON.stringify(body, null, 2)], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url; a.download = name;
+          document.body.appendChild(a); a.click();
+          setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 1000);
+        } catch (e) {
+          console.warn('[hand-scraper phase7] emitEmergencyStopFile failed for', name, e && e.message);
+        }
+      }
+      console.warn('[hand-scraper phase7] EMERGENCY STOP emitted:', detail);
+    } catch (_) {}
+  }
+
+  let _humanNodeCount = 0;
+  let _humanNextCategoryAt = null;
+  let _humanNextNodeBrowseAt = null;
+  function _humanNextInterval(rangeName) {
+    const [lo, hi] = _hRange(rangeName, 0, 0);
+    if (lo <= 0 || hi <= 0) return null;
+    return _hPickInt(lo, hi);
+  }
+  async function maybeHumanLikeNoiseBetweenNodes() {
+    _humanNodeCount++;
+    if (_humanNextCategoryAt === null) _humanNextCategoryAt = _humanNextInterval('category_every_n_range');
+    if (_humanNextNodeBrowseAt === null) _humanNextNodeBrowseAt = _humanNextInterval('node_hover_every_n_range');
+    if (_humanNextCategoryAt !== null && _humanNodeCount >= _humanNextCategoryAt) {
+      const k = _hPickInt(..._hRange('category_count_range', 1, 2));
+      if (k > 0) await humanCategoryExploration(k);
+      _humanNextCategoryAt = _humanNodeCount + (_humanNextInterval('category_every_n_range') || 0);
+    }
+    if (_humanNextNodeBrowseAt !== null && _humanNodeCount >= _humanNextNodeBrowseAt) {
+      const k = _hPickInt(..._hRange('node_hover_count_range', 1, 3));
+      if (k > 0) await humanNodeBrowseHover(k);
+      _humanNextNodeBrowseAt = _humanNodeCount + (_humanNextInterval('node_hover_every_n_range') || 0);
     }
   }
 
@@ -371,6 +609,7 @@
   async function dfsStreet(state, walkResult, opts = {}) {
     // v15: random 3-5s inter-node wait at the start of every node visit.
     // Configurable via window.__msNodeWaitMin / window.__msNodeWaitMax.
+    await maybeHumanLikeNoiseBetweenNodes();
     await interNodeWait();
     // Auto-init streetEntryNode on first call into a street.
     if (state.streetEntryNode === undefined) state.streetEntryNode = state.node || '';
@@ -466,7 +705,8 @@
       // capture for N-A is made by the click above, so range data for the
       // post-All-in spot is fully preserved.
       if (pickIsAllIn) {
-        await interNodeWait();
+        await maybeHumanLikeNoiseBetweenNodes();
+    await interNodeWait();
         const abAllIn = await waitForActionPanelStable(4000, 500);
         if (!abAllIn || abAllIn.actions.length === 0) {
           walkResult.warnings.push(`all-in node ${childPath}: no stable action panel after click (capture may still be valid)`);
@@ -681,7 +921,13 @@
     pickCardCommit, listCanonicalCards,
     waitForActionPanelStable,
     interNodeWait,
+    humanNodeBrowseHover, humanCategoryExploration, humanTurnBrowseHover,
+    maybeHumanLikeNoiseBetweenNodes,
+    // PHASE 7
+    detectUnexpectedState, emitEmergencyStopFile,
   };
   window.__msV18WalkerInstalled = true;
-  return 'multi-street walker installed (window.__W) [v18 all-in no-descend + back-out chain collapse; v15 random 3-5s inter-node wait; v13 plomm envelope support; v11 dynamic bet sizings + 1/5 pot static]';
+  window.__msPhase4HumanLikeInstalled = true;
+  window.__msPhase7SafetyInstalled = true;
+  return 'multi-street walker installed (window.__W) [phase 7 safety detect + emergency stop emit; phase 4 human-like noise (long pauses + hover bursts + category exploration); v18 all-in no-descend + back-out chain collapse; v15 random 3-5s inter-node wait; v13 plomm envelope support; v11 dynamic bet sizings + 1/5 pot static]';
 })();
