@@ -212,8 +212,89 @@
   // chevron wrappers in the Categories panel (bottom-left). No /range/url
   // calls. Caller's category_selector cfg knob can override the chevron
   // selector if the trainer DOM changes later.
+  // TIER 2 FIX #4: ensure the Categories tab is active so its panel renders.
+  //   The tab label is the leaf element with textContent === 'Categories'.
+  //   Clicking the nearest clickable ancestor activates the tab.
+  //   Idempotent via window.__msCategoriesTabActivated.
+  async function activateCategoriesTab() {
+    if (window.__msCategoriesTabActivated) return true;
+    try {
+      // If the Categories panel is already locatable, the tab is active.
+      if (_msFindCategoriesPanel()) {
+        window.__msCategoriesTabActivated = true;
+        return true;
+      }
+      const catLabel = [...document.querySelectorAll('*')].find(
+        e => (e.textContent || '').trim() === 'Categories' && e.children.length === 0
+      );
+      if (!catLabel) return false;
+      // Walk up to find a clickable ancestor (cursor:pointer, BUTTON, or role=tab).
+      let clickable = catLabel;
+      for (let i = 0; i < 6 && clickable; i++) {
+        const tag = (clickable.tagName || '').toUpperCase();
+        const role = clickable.getAttribute && clickable.getAttribute('role');
+        let cur = '';
+        try { cur = getComputedStyle(clickable).cursor || ''; } catch (_) {}
+        if (cur === 'pointer' || tag === 'BUTTON' || role === 'tab') break;
+        clickable = clickable.parentElement;
+      }
+      if (!clickable) clickable = catLabel.parentElement;
+      if (!clickable) return false;
+      clickable.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+      await sleep(150 + Math.floor(Math.random() * 250));
+      clickable.click();
+      await sleep(600 + Math.floor(Math.random() * 600));
+      const ok = !!_msFindCategoriesPanel();
+      window.__msCategoriesTabActivated = ok;
+      return ok;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // TIER 2 FIX #5: pretendPartialBrowse -- pure-noise hover-only browse of
+  //   the currently-open turn modal. Hovers 3-5 random non-used cells with
+  //   small dwell pauses, optionally triggers a small category burst. NEVER
+  //   clicks a card (zero /range/url calls). Caller passes currentTerminal
+  //   so it can be logged.
+  async function pretendPartialBrowse(currentTerminal) {
+    try {
+      if (modalKind() !== 'turn') return 0;
+      const cells = readModalCells('turn');
+      if (!cells.length) return 0;
+      const pool = cells.filter(c => c.status === 'ok');
+      if (!pool.length) return 0;
+      const k = 3 + Math.floor(Math.random() * 3); // 3-5
+      const picks = [];
+      const poolCopy = pool.slice();
+      for (let i = 0; i < k && poolCopy.length; i++) {
+        picks.push(poolCopy.splice(Math.floor(Math.random() * poolCopy.length), 1)[0]);
+      }
+      for (const cell of picks) {
+        if (!cell.el) continue;
+        try {
+          cell.el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+          cell.el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }));
+        } catch (_) {}
+        await sleep(600 + Math.floor(Math.random() * 1400));
+      }
+      // Optional category nudge during the browse (50% chance).
+      if (Math.random() < 0.5) {
+        try { await humanCategoryExploration(1); } catch (_) {}
+      }
+      window.__msHumanStats = window.__msHumanStats || { node_hovers: 0, category_bursts: 0, turn_hovers: 0, partial_browses: 0 };
+      window.__msHumanStats.partial_browses = (window.__msHumanStats.partial_browses || 0) + 1;
+      return picks.length;
+    } catch (e) {
+      return 0;
+    }
+  }
+
   async function humanCategoryExploration(k) {
     const cfg = _hcfg();
+    // TIER 2 FIX #4: try to make the Categories tab active before searching
+    //   for the panel. Cheap (no-op if already active).
+    try { await activateCategoriesTab(); } catch (_) {}
     const panel = _msFindCategoriesPanel();
     if (!panel) {
       // Categories panel not found -- maybe the user is on a different tab
@@ -925,9 +1006,12 @@
     maybeHumanLikeNoiseBetweenNodes,
     // PHASE 7
     detectUnexpectedState, emitEmergencyStopFile,
+    // TIER 2
+    activateCategoriesTab, pretendPartialBrowse,
   };
   window.__msV18WalkerInstalled = true;
   window.__msPhase4HumanLikeInstalled = true;
   window.__msPhase7SafetyInstalled = true;
-  return 'multi-street walker installed (window.__W) [phase 7 safety detect + emergency stop emit; phase 4 human-like noise (long pauses + hover bursts + category exploration); v18 all-in no-descend + back-out chain collapse; v15 random 3-5s inter-node wait; v13 plomm envelope support; v11 dynamic bet sizings + 1/5 pot static]';
+  window.__msTier2NoiseInstalled = true;
+  return 'multi-street walker installed (window.__W) [tier 2 noise: categories-tab activate + partial-browse; phase 7 safety detect + emergency stop emit; phase 4 human-like noise (long pauses + hover bursts + category exploration); v18 all-in no-descend + back-out chain collapse; v15 random 3-5s inter-node wait; v13 plomm envelope support; v11 dynamic bet sizings + 1/5 pot static]';
 })();

@@ -440,6 +440,24 @@
     try {
       window._capturedRequests = [];
       H.installInterceptors();
+      // TIER 1 FIX (#7): defensive modal close at run start. If a previous
+      //   session ended with the turn modal open (or the user manually opened
+      //   one), the walker can fail to identify blocks correctly. Always
+      //   start from a clean DOM.
+      try {
+        if (W.modalKind && W.modalKind()) {
+          await W.closeModalX();
+          await sleep(300);
+        }
+      } catch (_) {}
+      // TIER 2 FIX #4: activate Categories tab so humanCategoryExploration
+      //   can find the panel. No-op if already active. Safe -- only clicks
+      //   a tab, no quota impact.
+      try {
+        if (typeof W.activateCategoriesTab === 'function') {
+          await W.activateCategoriesTab();
+        }
+      } catch (_) {}
       window.__msProgress.phase = 'walking';
 
       // v17: skip the flop walk entirely if the caller provided cached terminals.
@@ -499,14 +517,18 @@
         flopSeg.filesToZip.push({ name: `${flop}/flop_manifest.json`, content: JSON.stringify(flopManifest, null, 2) });
 
         if (scope === 'flop+turn') {
-          let preTerminals = identifyTerminals(flopNodes, 'flop');
-          if (cfg.flop_terminal_filter) preTerminals = preTerminals.filter(t => cfg.flop_terminal_filter(t.terminal_node));
-          flopManifest.pre_created_terminal_folders = preTerminals.map(t => t.terminal_node);
+          // TIER 1 FIX: pre-create folders for ALL terminals in the flop zip,
+          //   ignoring cfg.flop_terminal_filter. The filter controls what gets
+          //   WALKED on this run, but the on-disk per-flop tree should always
+          //   contain every terminal directory so downstream tooling sees the
+          //   full structure.
+          const allTerminals = identifyTerminals(flopNodes, 'flop');
+          flopManifest.pre_created_terminal_folders = allTerminals.map(t => t.terminal_node);
           flopSeg.filesToZip[flopSeg.filesToZip.length - 1].content = JSON.stringify(flopManifest, null, 2);
-          for (const t of preTerminals) {
+          for (const t of allTerminals) {
             flopSeg.filesToZip.push({ name: `${flop}/${t.terminal_node}/.keep`, content: '' });
           }
-          log('pre_created_terminal_folders', { n: preTerminals.length, list: preTerminals.map(t => t.terminal_node) });
+          log('pre_created_terminal_folders', { n: allTerminals.length, list: allTerminals.map(t => t.terminal_node) });
         }
 
         if (cfg.skip_flop_zip === true) {
@@ -553,7 +575,8 @@
 
       if (scope === 'flop') {
         delete result.nodesByKeyShortcut;
-        result.finished_at = new Date().toISOString();
+        try { if (W.modalKind && W.modalKind()) { await W.closeModalX(); } } catch (_) {}
+      result.finished_at = new Date().toISOString();
         result.elapsed_s = Math.round((Date.now() - window.__msProgress.t_start) / 1000);
         window.__msProgress.phase = 'done';
         window.__msResult = result;
@@ -572,7 +595,8 @@
           log('user_abort', { phase: 'after_flop' });
         }
         delete result.nodesByKeyShortcut;
-        result.finished_at = new Date().toISOString();
+        try { if (W.modalKind && W.modalKind()) { await W.closeModalX(); } } catch (_) {}
+      result.finished_at = new Date().toISOString();
         result.elapsed_s = Math.round((Date.now() - window.__msProgress.t_start) / 1000);
         window.__msProgress.phase = window.__msQuotaExceeded ? 'aborted_quota' : 'aborted_user';
         window.__msResult = result;
@@ -587,14 +611,22 @@
       } else {
         flopTerminals = identifyTerminals(flopNodes, 'flop');
       }
-      if (cfg.flop_terminal_filter) flopTerminals = flopTerminals.filter(t => cfg.flop_terminal_filter(t.terminal_node));
-      // v17: cache the terminal structure on window so buildCheckpoint can include
-      //      it in the resume.json, enabling skip_flop_walk on future resumes.
+      // TIER 1 FIX: cache the FULL terminal list (unfiltered) so the ledger has
+      //   the complete structural picture even when the run filters to a subset.
+      //   Only the walk loop below sees the filtered list.
       window.__msCachedFlopTerminals = flopTerminals.map(t => ({
         parent: t.parent, terminal_node: t.terminal_node, via: t.via, code: t.code,
       }));
+      const allTerminalsForLedger = flopTerminals.slice();
+      if (cfg.flop_terminal_filter) flopTerminals = flopTerminals.filter(t => cfg.flop_terminal_filter(t.terminal_node));
       result.summary.flop_terminals = flopTerminals.length;
-      log('flop_terminals_identified', { n: flopTerminals.length, list: flopTerminals.map(t => t.terminal_node), from_cache: !!skipFlopWalk });
+      result.summary.flop_terminals_all = allTerminalsForLedger.length;
+      log('flop_terminals_identified', {
+        n_walked: flopTerminals.length, n_all: allTerminalsForLedger.length,
+        list: flopTerminals.map(t => t.terminal_node),
+        all_list: allTerminalsForLedger.map(t => t.terminal_node),
+        from_cache: !!skipFlopWalk,
+      });
 
       for (const ft of flopTerminals) {
         if (window.__msQuotaExceeded || window.__msAborted) {
@@ -672,8 +704,14 @@
             started_at: result.started_at,
             finished_at: new Date().toISOString(),
           };
+          // TIER 1 FIX: per-card manifest name in zip_per_card mode.
+          //   Legacy chunk mode keeps _chunk<NNN>_manifest.json so old zips
+          //   on disk stay extractable.
+          const manifestName = (zipPerCard && cardForName)
+            ? `_${cardForName}_manifest.json`
+            : `_chunk${idxStr}_manifest.json`;
           const filesWithManifest = chunkState.files.concat([{
-            name: `_chunk${idxStr}_manifest.json`,
+            name: manifestName,
             content: JSON.stringify(chunkManifest, null, 2),
           }]);
           log('chunk_flush_start', {
@@ -735,6 +773,17 @@
               result.warnings.push(`emit_resume_file (chunk ${chunkZipName}) failed: ${e.message}`);
             }
           }
+          // TIER 2 FIX #5: optional partial-browse noise BEFORE the pause.
+          //   Lets human_like.partial_browse_chance control how often a
+          //   between-card "looked at other cards" burst fires. Pure noise:
+          //   no clicks on cards, no extra /range/url calls.
+          try {
+            const pbChance = (humanCfg && typeof humanCfg.partial_browse_chance === 'number')
+              ? humanCfg.partial_browse_chance : 0;
+            if (pbChance > 0 && Math.random() < pbChance && typeof W.pretendPartialBrowse === 'function') {
+              await W.pretendPartialBrowse(ft.terminal_node);
+            }
+          } catch (_) {}
           if (!autoContinue) await pauseUntilContinue(`turn chunk emitted (${chunkZipName})`);
           return zipEntry;
         }
@@ -1059,7 +1108,17 @@
             ? targetCardsPerTerminal[ft.terminal_node]
             : null;
           const cellByCard = new Map(cells.map(c => [c.card, c]));
-          const iterCards = targetList ? targetList : cells.map(c => c.card);
+          let iterCards = targetList ? targetList : cells.map(c => c.card);
+          // TIER 3 FIX #6: random visit order when no explicit targetList and
+          //   cfg.shuffle_cards is true. Deterministic top-to-bottom order
+          //   only applies in legacy / debug mode.
+          if (!targetList && cfg.shuffle_cards === true && iterCards.length > 1) {
+            iterCards = iterCards.slice();
+            for (let i = iterCards.length - 1; i > 0; i--) {
+              const j = Math.floor(Math.random() * (i + 1));
+              [iterCards[i], iterCards[j]] = [iterCards[j], iterCards[i]];
+            }
+          }
 
           for (const wantedCard of iterCards) {
             if (visitedThisTerminal.has(wantedCard)) continue;
@@ -1155,6 +1214,7 @@
         result.aborted_by_user = true;
       }
       result.summary.reopen_stats = window.__msProgress.reopen_stats;
+      try { if (W.modalKind && W.modalKind()) { await W.closeModalX(); } } catch (_) {}
       result.finished_at = new Date().toISOString();
       result.elapsed_s = Math.round((Date.now() - window.__msProgress.t_start) / 1000);
       window.__msProgress.phase = window.__msQuotaExceeded ? 'aborted_quota' : (window.__msAborted ? 'aborted_user' : 'done');
@@ -1178,6 +1238,8 @@
   window.__msPhase3SessionWrapperInstalled = true;
   window.__msPhase4OrchestratorWiredInstalled = true;
   window.__msPhase7EmergencyHookInstalled = true;
+  window.__msTier1FixesInstalled = true;
+  window.__msTier23OrchInstalled = true;
 
   // ---------------------------------------------------------------------
   // PHASE 3: __scrapeSession -- convenience wrapper for the multi-device
@@ -1269,6 +1331,6 @@
     };
   }
 
-  return 'multi-street scraper installed (window.__scrapeMultiStreet, window.__scrapeSession) [phase 7 emergency-stop hook; phase 4 human-like noise wired (cfg.human_like -> window.__msHumanCfg + turn hover hook); phase 3 session wrapper; phase 2 card maps + target_cards_per_terminal; phase 1 session mode (zip_per_card + device_name + session_id); post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + emit_resume_file + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
+  return 'multi-street scraper installed (window.__scrapeMultiStreet, window.__scrapeSession) [tier 2/3 orch: categories-activate + partial-browse + shuffle_cards; tier-1 fixes: all-terminals-cached + per-card-manifest + modal-cleanup; phase 7 emergency-stop hook; phase 4 human-like noise wired (cfg.human_like -> window.__msHumanCfg + turn hover hook); phase 3 session wrapper; phase 2 card maps + target_cards_per_terminal; phase 1 session mode (zip_per_card + device_name + session_id); post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + emit_resume_file + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
 })();
 
