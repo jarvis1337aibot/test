@@ -190,15 +190,45 @@
       );
     } catch (_) {}
     if (!catLabel) return null;
-    // POST-TIER-3 FIX (2026-05-22): broaden category-label match.
-    //   Previously hard-coded "Unpaired" which is absent on paired boards
-    //   (e.g. 4s4d2c shows Quads/Full House/Trips/One pair/Draws/Air, no
-    //   "Unpaired"). Match any PLO category leaf label instead.
-    const CATEGORY_LABELS_RE = /\b(Unpaired|One pair|One Pair|Two pair|Two Pair|Set|Trips|Quads|Full House|Straight|Flush|Draws|Air|Overpair|Pair)\b/;
+    // POST-TIER-3 FIX v2 (2026-05-22): the trainer renders category labels
+    //   smushed against percentages with no separator ("Quads100%0.39%Full
+    //   House81%19%..."), so \b word boundaries fail. Switch to plain
+    //   includes() with a 2+ label requirement to avoid Pair/Air false
+    //   positives. Also start the walk from chevrons (not the 'Categories'
+    //   tab label) because on the live trainer the tab label and the
+    //   content panel are in SEPARATE DOM subtrees -- the original
+    //   walk-up-from-label approach can never reach the panel.
+    const CATEGORY_LABELS = [
+      'Unpaired', 'One pair', 'One Pair', 'Two pair', 'Two Pair',
+      'Trips', 'Quads', 'Full House', 'Straight', 'Flush',
+      'Draws', 'Air', 'Overpair'
+    ];
+    function _msIsCategoryPanel(el) {
+      const txt = el.textContent || '';
+      if (!/\d+\.\d{2}%/.test(txt)) return false;
+      let nMatch = 0;
+      for (const lbl of CATEGORY_LABELS) {
+        if (txt.includes(lbl)) { nMatch++; if (nMatch >= 2) return true; }
+      }
+      return false;
+    }
+    // Walk up from every chevron (not from the Categories tab label).
+    const _chevrons = document.querySelectorAll('.flex.size-4.shrink-0.items-center.cursor-pointer');
+    for (const _ch of _chevrons) {
+      let _n = _ch;
+      for (let _i = 0; _i < 15 && _n; _i++) {
+        if (_n !== document.body && _msIsCategoryPanel(_n)) {
+          window.__msCatPanel = _n;
+          return _n;
+        }
+        _n = _n.parentElement;
+      }
+    }
+    // Fallback: if no chevrons (rare), retain the old walk-up-from-label path
     let panel = catLabel;
     while (panel) {
       const txt = panel.textContent || '';
-      if (CATEGORY_LABELS_RE.test(txt) && /\d+\.\d{2}%/.test(txt) && panel !== document.body) {
+      if (panel !== document.body && _msIsCategoryPanel(panel)) {
         // Exclude the whole app shell (which also contains everything else)
         let w = 9999;
         try { w = panel.getBoundingClientRect().width; } catch (_) {}
@@ -296,41 +326,50 @@
   }
 
   async function humanCategoryExploration(k) {
+    // POST-TIER-3 FIX v2 (2026-05-22): new timing per user request.
+    //   - Wait 5-8s on entry so a fresh node has time to fully render the
+    //     Categories panel (slow VPN connections can need this).
+    //   - 1-3s gap between successive chevron clicks.
+    //   - 5-15s wait after the last click (lets the trainer settle and
+    //     mimics a human reading the expanded subcategories).
+    //   - DO NOT collapse the chevrons back. Leave them expanded; the
+    //     subsequent walker action picks up cleanly because the chevrons
+    //     are non-destructive UI state.
     const cfg = _hcfg();
-    // TIER 2 FIX #4: try to make the Categories tab active before searching
-    //   for the panel. Cheap (no-op if already active).
+    function _rint(lo, hi) { return lo + Math.floor(Math.random() * (hi - lo + 1)); }
+    // Initial settle wait — at least 5 s, random up to 8 s.
+    await sleep(_rint(5000, 8000));
     try { await activateCategoriesTab(); } catch (_) {}
     const panel = _msFindCategoriesPanel();
     if (!panel) {
-      // Categories panel not found -- maybe the user is on a different tab
-      // (e.g. Reports). Quietly no-op rather than fall back to dangerous
-      // heuristics that might click trainer-state buttons.
+      // Categories panel not found — maybe slow render or different tab.
+      // Quietly no-op rather than fall back to dangerous heuristics.
       return 0;
     }
     const chevronSel = cfg.category_selector || '.flex.size-4.shrink-0.items-center.cursor-pointer';
     let chevrons = [];
-    try { chevrons = [...panel.querySelectorAll(chevronSel)]; } catch (_) { return 0; }
+    try { chevrons = [...panel.querySelectorAll(chevronSel)]; } catch (_) {}
     if (!chevrons.length) return 0;
+    // Pick K random distinct chevrons. K typically 1-2 per call.
+    const picks = [];
     const pool = chevrons.slice();
-    const targets = [];
     for (let i = 0; i < k && pool.length; i++) {
-      targets.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
+      picks.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
     }
-    for (const el of targets) {
-      try {
-        el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-        await sleep(300 + Math.floor(Math.random() * 700));
-        el.click();                                   // expand
-        await sleep(3000 + Math.floor(Math.random() * 5000));  // "reading"
-        if (Math.random() < 0.5) {
-          el.click();                                 // collapse back
-          await sleep(500 + Math.floor(Math.random() * 1500));
-        }
-      } catch (_) {}
+    if (!picks.length) return 0;
+    // Click each with 1-3s gap. No collapse afterward.
+    for (let i = 0; i < picks.length; i++) {
+      try { picks[i].click(); } catch (_) {}
+      if (i < picks.length - 1) {
+        await sleep(_rint(1000, 3000));
+      }
     }
-    window.__msHumanStats = window.__msHumanStats || { node_hovers: 0, category_bursts: 0, turn_hovers: 0 };
-    window.__msHumanStats.category_bursts += targets.length;
-    return targets.length;
+    // Final settle wait: 5-15s after the last click.
+    await sleep(_rint(5000, 15000));
+    // Stats
+    window.__msHumanStats = window.__msHumanStats || { node_hovers: 0, category_bursts: 0, turn_hovers: 0, partial_browses: 0 };
+    window.__msHumanStats.category_bursts = (window.__msHumanStats.category_bursts || 0) + 1;
+    return picks.length;
   }
 
   async function humanTurnBrowseHover(targetCard, k) {
