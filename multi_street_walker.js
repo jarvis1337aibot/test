@@ -769,6 +769,75 @@
     const blocksNow = readBlocks();
     const myIndex = blocksNow.findIndex(b => b.isActive);
 
+    // POST-TIER-7 (2026-05-23): INLINE TURN-MODAL CAPTURE during flop DFS.
+    //   When this node has any enabled closes_street child (Call after raise,
+    //   second Check, etc.), click it -> wait for the turn modal -> read
+    //   cells -> save to walkResult.terminal_card_maps[terminal_node] ->
+    //   close modal -> back-out to this node. Replaces the orchestrator's
+    //   separate post-walk modal-capture pass.
+    if (state.street === 'flop') {
+      for (const child of childrenSpec) {
+        if (!child.closes_street || child.disabled) continue;
+        const terminalNode = state.node ? `${state.node}-${child.code}` : child.code;
+        // Re-read the active panel to get a fresh element handle for the closer
+        const abClose = await waitForActionPanelStable(4000, 500);
+        if (!abClose || abClose.actions.length === 0) {
+          walkResult.warnings.push(`inline modal capture: no active at ${state.node} for closer ${child.label}`);
+          continue;
+        }
+        const closerEl = abClose.actions.find(a => a.label === child.label && !a.disabled)?.el;
+        if (!closerEl) {
+          walkResult.warnings.push(`inline modal capture: closer "${child.label}" not found at ${state.node}`);
+          continue;
+        }
+        const r = await clickActionAndWait(closerEl, terminalNode);
+        if (!r.success || urlNode() !== terminalNode) {
+          walkResult.warnings.push(`inline modal capture: click "${child.label}" failed at ${state.node} (got "${r.after}" expected "${terminalNode}")`);
+          // Try to recover URL
+          try {
+            const blocksRecover = readBlocks();
+            const myBlockRecover = blocksRecover[myIndex];
+            if (myBlockRecover && myBlockRecover.headerEl && urlNode() !== state.node) {
+              await clickHeaderAndWait(myBlockRecover.headerEl, state.node);
+            }
+          } catch (_) {}
+          continue;
+        }
+        // Wait for the turn modal to render
+        let t0 = Date.now();
+        while (Date.now() - t0 < 4000 && modalKind() !== 'turn') await sleep(120);
+        if (modalKind() === 'turn') {
+          const cells = readModalCells('turn');
+          const available = cells.filter(c => c.status === 'ok').map(c => c.card);
+          const used = cells.filter(c => c.status === 'used').map(c => c.card);
+          const dim_dom = cells.filter(c => c.status === 'dim').map(c => c.card);
+          walkResult.terminal_card_maps = walkResult.terminal_card_maps || {};
+          walkResult.terminal_card_maps[terminalNode] = {
+            recorded_at: new Date().toISOString(),
+            total_cells: cells.length,
+            available, used, dim_dom,
+            aliases: [],
+            terminal: terminalNode,
+            source: 'inline_dfs_capture',
+          };
+          try { await closeModalX(); } catch (_) {}
+          await sleep(150);
+        } else {
+          walkResult.warnings.push(`inline modal capture: turn modal did not open at ${terminalNode}`);
+        }
+        // Back-out to state.node by clicking my header
+        const blocksAfterClose = readBlocks();
+        const myBlockAfterClose = blocksAfterClose[myIndex];
+        if (myBlockAfterClose && myBlockAfterClose.headerEl) {
+          const hbr = await clickHeaderAndWait(myBlockAfterClose.headerEl, state.node);
+          if (!hbr.success || urlNode() !== state.node) {
+            walkResult.warnings.push(`inline modal capture: back-out wrong: exp="${state.node}" got="${urlNode()}"`);
+            return;
+          }
+        }
+      }
+    }
+
     const walkedLabels = new Set();
     let iterSafety = 0;
     while (iterSafety++ < 12) {
@@ -1058,6 +1127,7 @@
   window.__msV18WalkerInstalled = true;
   window.__msPhase4HumanLikeInstalled = true;
   window.__msPhase7SafetyInstalled = true;
+  window.__msInlineModalCaptureInstalled = true; // 2026-05-23 v7: inline turn-modal capture in flop DFS
   window.__msTier2NoiseInstalled = true;
   return 'multi-street walker installed (window.__W) [tier 2 noise: categories-tab activate + partial-browse; phase 7 safety detect + emergency stop emit; phase 4 human-like noise (long pauses + hover bursts + category exploration); v18 all-in no-descend + back-out chain collapse; v15 random 3-5s inter-node wait; v13 plomm envelope support; v11 dynamic bet sizings + 1/5 pot static]';
 })();

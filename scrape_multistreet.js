@@ -514,54 +514,6 @@
         } catch (_) { /* defensive */ }
       }
 
-      // POST-TIER-4 (2026-05-23): SYSTEMATIC TERMINAL-MODAL CAPTURE PASS.
-      //   After the flop walk completes, BEFORE the flop zip emits, replay
-      //   to each terminal, open the turn modal, capture the cells, close.
-      //   This makes terminal_card_maps fully populated by the time the
-      //   workload JSONs emit later. Skipped on resume (skipFlopWalk) because
-      //   in that path the worker already has card_maps from the workload.
-      if (!skipFlopWalk && !dryRun && Array.isArray(window.__msCachedFlopTerminals) && window.__msCachedFlopTerminals.length) {
-        log('phase', { name: 'capture_terminal_modals' });
-        window.__msProgress.phase = 'capturing_terminal_modals';
-        result.terminal_card_maps = result.terminal_card_maps || {};
-        for (const ft of window.__msCachedFlopTerminals) {
-          try {
-            if (W.modalKind && W.modalKind()) { try { await W.closeModalX(); } catch (_) {} }
-            const okReplay = await replayFromFlopRoot(ft.parent, result);
-            if (!okReplay) {
-              result.warnings.push(`pre-zip modal capture: replay to ${ft.terminal_node} failed`);
-              continue;
-            }
-            const okOpen = await openModalByCloser(ft.via);
-            if (!okOpen) {
-              result.warnings.push(`pre-zip modal capture: open modal at ${ft.terminal_node} failed`);
-              continue;
-            }
-            const cells = W.readModalCells('turn');
-            const available = cells.filter(c => c.status === 'ok').map(c => c.card);
-            const used      = cells.filter(c => c.status === 'used').map(c => c.card);
-            const dim_dom   = cells.filter(c => c.status === 'dim').map(c => c.card);
-            result.terminal_card_maps[ft.terminal_node] = {
-              recorded_at: new Date().toISOString(),
-              recorded_by_device: cfg.device_name || null,
-              recorded_by_session: cfg.session_id || null,
-              total_cells: cells.length,
-              available, used, dim_dom,
-              aliases: [],
-              terminal: ft.terminal_node,
-              source: 'pre_zip_capture',
-            };
-            log('terminal_modal_captured', { terminal: ft.terminal_node, n_available: available.length, n_used: used.length, n_dim: dim_dom.length });
-            try { await W.closeModalX(); } catch (_) {}
-            await sleep(300);
-          } catch (e) {
-            result.warnings.push(`pre-zip modal capture at ${ft.terminal_node}: ${e.message}`);
-            try { await W.closeModalX(); } catch (_) {}
-          }
-        }
-        try { await ensureFlopRoot(); } catch (_) {}
-      }
-
       if (!dryRun && !skipFlopWalk) {
         window.__msProgress.phase = 'scraping_flop';
         const flopZipName = `${result.tree}_${result.flop}_flop.zip`;

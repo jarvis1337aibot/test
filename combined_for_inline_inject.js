@@ -1,15 +1,20 @@
 /* combined_for_inline_inject.js -- hand-scraper-postflop-flop-turn
  *
- * v7 (2026-05-23): producer/worker model with 100% workload coverage +
- * constrained random partition (each workload gets 5-40% of EACH terminal's
- * walkable cards; total across N workloads = 100% per terminal).
+ * v8 (2026-05-23): inline turn-modal capture during flop DFS
  *
- * Schema slim (v2): only fields a worker needs.
- * Skips resume_after_flop_zip.json in producer mode (workloads carry it).
- * v4 timings carried forward.
+ *   Walker now opens the turn modal at each terminal during the flop walk
+ *   itself (when a closer action is reached), captures cells, closes, and
+ *   continues. Replaces the orchestrator's separate post-walk replay pass
+ *   (saves ~50-100s per producer run; same correctness).
+ *
+ *   v7 producer/worker model: flop walk -> N workload JSONs (5-40% per
+ *     terminal, summing to 100% coverage, slim schema, url field) -> STOP.
+ *     Producer skips resume_after_flop_zip.json (workloads carry resume info).
+ *
+ *   v4 timings carried forward (2-4s inter-node, 2-4s nav pacing).
  */
 
-/* ==================== 1) WALKER ==================== */
+/* ==================== 1) WALKER (v8 inline modal capture) ==================== */
 /* multi_street_walker.js - DOM-only walker for the PLO Master Mind postflop trainer.
  *
  * Installs window.__W with primitives for DFS, modal handling, alias-aware card
@@ -781,6 +786,75 @@
     const blocksNow = readBlocks();
     const myIndex = blocksNow.findIndex(b => b.isActive);
 
+    // POST-TIER-7 (2026-05-23): INLINE TURN-MODAL CAPTURE during flop DFS.
+    //   When this node has any enabled closes_street child (Call after raise,
+    //   second Check, etc.), click it -> wait for the turn modal -> read
+    //   cells -> save to walkResult.terminal_card_maps[terminal_node] ->
+    //   close modal -> back-out to this node. Replaces the orchestrator's
+    //   separate post-walk modal-capture pass.
+    if (state.street === 'flop') {
+      for (const child of childrenSpec) {
+        if (!child.closes_street || child.disabled) continue;
+        const terminalNode = state.node ? `${state.node}-${child.code}` : child.code;
+        // Re-read the active panel to get a fresh element handle for the closer
+        const abClose = await waitForActionPanelStable(4000, 500);
+        if (!abClose || abClose.actions.length === 0) {
+          walkResult.warnings.push(`inline modal capture: no active at ${state.node} for closer ${child.label}`);
+          continue;
+        }
+        const closerEl = abClose.actions.find(a => a.label === child.label && !a.disabled)?.el;
+        if (!closerEl) {
+          walkResult.warnings.push(`inline modal capture: closer "${child.label}" not found at ${state.node}`);
+          continue;
+        }
+        const r = await clickActionAndWait(closerEl, terminalNode);
+        if (!r.success || urlNode() !== terminalNode) {
+          walkResult.warnings.push(`inline modal capture: click "${child.label}" failed at ${state.node} (got "${r.after}" expected "${terminalNode}")`);
+          // Try to recover URL
+          try {
+            const blocksRecover = readBlocks();
+            const myBlockRecover = blocksRecover[myIndex];
+            if (myBlockRecover && myBlockRecover.headerEl && urlNode() !== state.node) {
+              await clickHeaderAndWait(myBlockRecover.headerEl, state.node);
+            }
+          } catch (_) {}
+          continue;
+        }
+        // Wait for the turn modal to render
+        let t0 = Date.now();
+        while (Date.now() - t0 < 4000 && modalKind() !== 'turn') await sleep(120);
+        if (modalKind() === 'turn') {
+          const cells = readModalCells('turn');
+          const available = cells.filter(c => c.status === 'ok').map(c => c.card);
+          const used = cells.filter(c => c.status === 'used').map(c => c.card);
+          const dim_dom = cells.filter(c => c.status === 'dim').map(c => c.card);
+          walkResult.terminal_card_maps = walkResult.terminal_card_maps || {};
+          walkResult.terminal_card_maps[terminalNode] = {
+            recorded_at: new Date().toISOString(),
+            total_cells: cells.length,
+            available, used, dim_dom,
+            aliases: [],
+            terminal: terminalNode,
+            source: 'inline_dfs_capture',
+          };
+          try { await closeModalX(); } catch (_) {}
+          await sleep(150);
+        } else {
+          walkResult.warnings.push(`inline modal capture: turn modal did not open at ${terminalNode}`);
+        }
+        // Back-out to state.node by clicking my header
+        const blocksAfterClose = readBlocks();
+        const myBlockAfterClose = blocksAfterClose[myIndex];
+        if (myBlockAfterClose && myBlockAfterClose.headerEl) {
+          const hbr = await clickHeaderAndWait(myBlockAfterClose.headerEl, state.node);
+          if (!hbr.success || urlNode() !== state.node) {
+            walkResult.warnings.push(`inline modal capture: back-out wrong: exp="${state.node}" got="${urlNode()}"`);
+            return;
+          }
+        }
+      }
+    }
+
     const walkedLabels = new Set();
     let iterSafety = 0;
     while (iterSafety++ < 12) {
@@ -1070,6 +1144,7 @@
   window.__msV18WalkerInstalled = true;
   window.__msPhase4HumanLikeInstalled = true;
   window.__msPhase7SafetyInstalled = true;
+  window.__msInlineModalCaptureInstalled = true; // 2026-05-23 v7: inline turn-modal capture in flop DFS
   window.__msTier2NoiseInstalled = true;
   return 'multi-street walker installed (window.__W) [tier 2 noise: categories-tab activate + partial-browse; phase 7 safety detect + emergency stop emit; phase 4 human-like noise (long pauses + hover bursts + category exploration); v18 all-in no-descend + back-out chain collapse; v15 random 3-5s inter-node wait; v13 plomm envelope support; v11 dynamic bet sizings + 1/5 pot static]';
 })();
@@ -1734,7 +1809,7 @@
   return 'multi-street helpers installed (window.__msHelpers) [v15 banner-only republish; v14 labelToTypeSize static-map fix; v13 plomm envelope support; v11 dynamic bet sizings]';
 })();
 
-/* ==================== 3) ORCHESTRATOR (v7 constrained random) ==================== */
+/* ==================== 3) ORCHESTRATOR (v7 producer + workload partition) ==================== */
 /* scrape_multistreet.js - flop+turn tree scraper for the PLO Master Mind
  * postflop trainer. Walks (flop -> every canonical turn under every flop
  * terminal), captures /range/url envelopes, decodes binary/plomm blobs,
@@ -2249,54 +2324,6 @@
             parent: t.parent, terminal_node: t.terminal_node, via: t.via, code: t.code,
           }));
         } catch (_) { /* defensive */ }
-      }
-
-      // POST-TIER-4 (2026-05-23): SYSTEMATIC TERMINAL-MODAL CAPTURE PASS.
-      //   After the flop walk completes, BEFORE the flop zip emits, replay
-      //   to each terminal, open the turn modal, capture the cells, close.
-      //   This makes terminal_card_maps fully populated by the time the
-      //   workload JSONs emit later. Skipped on resume (skipFlopWalk) because
-      //   in that path the worker already has card_maps from the workload.
-      if (!skipFlopWalk && !dryRun && Array.isArray(window.__msCachedFlopTerminals) && window.__msCachedFlopTerminals.length) {
-        log('phase', { name: 'capture_terminal_modals' });
-        window.__msProgress.phase = 'capturing_terminal_modals';
-        result.terminal_card_maps = result.terminal_card_maps || {};
-        for (const ft of window.__msCachedFlopTerminals) {
-          try {
-            if (W.modalKind && W.modalKind()) { try { await W.closeModalX(); } catch (_) {} }
-            const okReplay = await replayFromFlopRoot(ft.parent, result);
-            if (!okReplay) {
-              result.warnings.push(`pre-zip modal capture: replay to ${ft.terminal_node} failed`);
-              continue;
-            }
-            const okOpen = await openModalByCloser(ft.via);
-            if (!okOpen) {
-              result.warnings.push(`pre-zip modal capture: open modal at ${ft.terminal_node} failed`);
-              continue;
-            }
-            const cells = W.readModalCells('turn');
-            const available = cells.filter(c => c.status === 'ok').map(c => c.card);
-            const used      = cells.filter(c => c.status === 'used').map(c => c.card);
-            const dim_dom   = cells.filter(c => c.status === 'dim').map(c => c.card);
-            result.terminal_card_maps[ft.terminal_node] = {
-              recorded_at: new Date().toISOString(),
-              recorded_by_device: cfg.device_name || null,
-              recorded_by_session: cfg.session_id || null,
-              total_cells: cells.length,
-              available, used, dim_dom,
-              aliases: [],
-              terminal: ft.terminal_node,
-              source: 'pre_zip_capture',
-            };
-            log('terminal_modal_captured', { terminal: ft.terminal_node, n_available: available.length, n_used: used.length, n_dim: dim_dom.length });
-            try { await W.closeModalX(); } catch (_) {}
-            await sleep(300);
-          } catch (e) {
-            result.warnings.push(`pre-zip modal capture at ${ft.terminal_node}: ${e.message}`);
-            try { await W.closeModalX(); } catch (_) {}
-          }
-        }
-        try { await ensureFlopRoot(); } catch (_) {}
       }
 
       if (!dryRun && !skipFlopWalk) {
