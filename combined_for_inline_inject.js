@@ -1,12 +1,16 @@
 /* combined_for_inline_inject.js -- hand-scraper-postflop-flop-turn
  *
- * v9.5 (2026-05-24): picker coalesces cfg.turn_cards_per_terminal as a
- *   fallback when cfg.target_cards_per_terminal is unset. Without this fix
- *   the picker iterated ALL ~50 modal cells, picked random non-targets,
- *   and fired pre-target partial walks for each -- burning quota with 0 zips.
+ * v9.6 (2026-05-24): partialWalkOnTerminal uses pickCardCommit instead of
+ *   clickCardAndWait so suitmap aliases are auto-recovered (get-rid-of-suitmap
+ *   protocol via reopenChipModal). On alias detection the partial walk
+ *   proceeds from the canonical -- the suit-map counterpart -- per the
+ *   standard partial walk protocol. Adds __msPartialWalkAliasRecoveries
+ *   counter + __msLastPartialWalkRequested / WasAlias fields.
  *
- * v9.4 carried forward: stabilizeBackToTerminal 2000ms + retry, post-partial-walk
- *   cleanup uses ensureTurnModalAtTerminal (cheap-with-replay fallback).
+ * v9.5: picker coalesces cfg.turn_cards_per_terminal as a fallback when
+ *   cfg.target_cards_per_terminal is unset.
+ * v9.4: stabilizeBackToTerminal 2000ms + retry, post-partial-walk cleanup
+ *   uses ensureTurnModalAtTerminal (cheap-with-replay fallback).
  */
 
 /* ==================== 1) WALKER ==================== */
@@ -344,11 +348,29 @@
         pick.el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }));
       } catch (_) {}
       await sleep(1000 + Math.floor(Math.random() * 1000));
+      // POST-TIER-9 FIX v9.6 (2026-05-24): use pickCardCommit instead of
+      //   clickCardAndWait so suitmap aliases are auto-recovered. If pick.card
+      //   is a suitmap alias, pickCardCommit:
+      //     1. Clicks the suitmap cell (URL gets ?suitMap=X, turn=<canonical>)
+      //     2. Detects the alias jump
+      //     3. Calls reopenChipModal('turn') -- the "get rid of suitmap" protocol
+      //     4. Re-clicks the actual canonical from the freshly-opened modal
+      //     5. Returns { was_alias: true, alias_requested: pick.card,
+      //                  committed: <canonical>, suitMap_was: <sm> }
+      //   The partial walk then proceeds from the canonical's subtree --
+      //   "partial walks the suit map counterpart per the partial walk protocol".
+      let partialCommit;
       try {
-        await clickCardAndWait(pick.el, 'turn');
+        partialCommit = await pickCardCommit(pick.card, 'turn');
       } catch (e) {
         try { await dismissNoSimPopupIfAny(); } catch (_) {}
         return 0;
+      }
+      const partialAliasRecovered = !!(partialCommit && partialCommit.was_alias);
+      const partialCardWalked = partialCommit ? partialCommit.committed : pick.card;
+      if (partialAliasRecovered) {
+        window.__msPartialWalkAliasRecoveries =
+          (window.__msPartialWalkAliasRecoveries || 0) + 1;
       }
       await sleep(2000 + Math.floor(Math.random() * 2000));
       // Walk 1-2 real action blocks forward (with end-of-line edge case)
@@ -387,7 +409,12 @@
       await sleep(10000 + Math.floor(Math.random() * 10000));
       window.__msHumanStats = window.__msHumanStats || { node_hovers: 0, category_bursts: 0, turn_hovers: 0, partial_browses: 0, partial_walks: 0 };
       window.__msHumanStats.partial_walks = (window.__msHumanStats.partial_walks || 0) + 1;
-      window.__msLastPartialWalkCard = pick.card;
+      // v9.6: record the CANONICAL we actually walked (post-alias recovery).
+      // The suitmap card itself is exposed as __msLastPartialWalkRequested for
+      // debugging; aliases get a dedicated flag + count.
+      window.__msLastPartialWalkCard = partialCardWalked;
+      window.__msLastPartialWalkRequested = pick.card;
+      window.__msLastPartialWalkWasAlias = partialAliasRecovered;
       window.__msLastPartialWalkTerminal = currentTerminal;
       window.__msLastPartialWalkActions = actionsWalked;
       window.__msLastPartialWalkEndOfLine = endOfLine;
@@ -4849,4 +4876,3 @@
   } catch (_) {}
   return { v17_extension_loaded: true };
 })();
-
