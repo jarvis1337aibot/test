@@ -953,33 +953,10 @@
           //   Lets human_like.partial_browse_chance control how often a
           //   between-card "looked at other cards" burst fires. Pure noise:
           //   no clicks on cards, no extra /range/url calls.
-          // POST-TIER-8 (2026-05-24) + v9 FIX (2026-05-24): real partial walk
-          //   between cards on the same terminal. Fires only if more
-          //   assigned cards remain. CRITICAL: ensureTurnModalAtTerminal()
-          //   MUST be called first because after pickCardCommit+dfsStreet
-          //   the trainer is at ?turn=X with the modal CLOSED. The partial
-          //   walk needs the modal OPEN to pick a random cell. Without the
-          //   reopen, partialWalkOnTerminal returns 0 silently.
-          try {
-            const _stillToWalk = (explicitCards || []).filter(
-              c => !(completedCardsPerTerminal[ft.terminal_node] || []).includes(c)
-            );
-            const pbChance = (humanCfg && typeof humanCfg.partial_browse_chance === 'number')
-              ? humanCfg.partial_browse_chance : 0;
-            if (_stillToWalk.length > 0 && pbChance > 0 && Math.random() < pbChance) {
-              // Reopen the turn modal at the terminal first (cheap path).
-              const _er = await ensureTurnModalAtTerminal();
-              if (_er.ok) {
-                const fn = (typeof W.partialWalkOnTerminal === 'function')
-                  ? W.partialWalkOnTerminal : W.pretendPartialBrowse;
-                if (typeof fn === 'function') {
-                  await fn(ft.terminal_node, { excludeCards: _stillToWalk });
-                }
-              } else {
-                result.warnings.push(`partial walk skipped at ${ft.terminal_node}: ensureTurnModalAtTerminal failed (${_er.path})`);
-              }
-            }
-          } catch (_) {}
+          // POST-TIER-9 v9.3 (2026-05-24): partial walk now fires BEFORE
+          //   each target card walk (in the cell loop), not after. The
+          //   old post-card partial-walk block was removed; this comment
+          //   marks the location for archaeology.
           if (!autoContinue) await pauseUntilContinue(`turn chunk emitted (${chunkZipName})`);
           return zipEntry;
         }
@@ -1239,6 +1216,15 @@
             log('quota_or_user_abort', { phase: 'cell_loop', terminal: ft.terminal_node });
             break;
           }
+          // POST-TIER-9 FIX B (2026-05-24): if explicitCards/targetList is set
+          //   AND every assigned card has been visited, exit immediately --
+          //   no point reopening the modal just to discover "no target left".
+          //   This eliminates one wasted reopen at the end of each terminal.
+          if (explicitCards && explicitCards.every(c => visitedThisTerminal.has(c))) {
+            terminalFullyDone = true;
+            terminalExitReason = 'all_targets_visited';
+            break;
+          }
           // PHASE 7: safety detection at safe boundary.
           //   If unexpected state (captcha, login redirect, page change),
           //   emit emergency-stop file + abort the run gracefully.
@@ -1345,6 +1331,28 @@
             break outer;
           }
           visitedThisTerminal.add(target.card);
+          // POST-TIER-9 v9.3 (2026-05-24): PRE-TARGET PARTIAL WALK.
+          //   Before each target card walk (including the first on a new
+          //   terminal), do a partial walk into a random non-target card's
+          //   subtree (1-2 actions + categories + 10-20s wait), then cheap-
+          //   reopen the modal so the real target walk proceeds normally.
+          //   excludeCards is the ENTIRE explicitCards list so the partial
+          //   walk can never pick a card we'll later try to walk for real.
+          try {
+            const pbChance = (humanCfg && typeof humanCfg.partial_browse_chance === 'number')
+              ? humanCfg.partial_browse_chance : 0;
+            if (pbChance > 0 && Math.random() < pbChance && typeof W.partialWalkOnTerminal === 'function') {
+              await W.partialWalkOnTerminal(ft.terminal_node, { excludeCards: explicitCards || [] });
+              // Cleanup: restore terminal + open modal so the upcoming
+              //   target commit proceeds without a forced full replay.
+              try {
+                const _stabOk = await stabilizeBackToTerminal(ft.terminal_node);
+                if (_stabOk) await W.reopenChipModal('turn');
+              } catch (e) {
+                result.warnings.push(`post-partial-walk cleanup at ${ft.terminal_node}: ${e.message}`);
+              }
+            }
+          } catch (_) {}
           // PHASE 4: hover 1-3 sibling cards before committing to target.
           //   No clicks -> no /range/url. Gated on cfg.human_like.turn_hover_count_range.
           try {

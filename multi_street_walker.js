@@ -311,6 +311,13 @@
   //   Old `pretendPartialBrowse` (hover-only) is kept as a thin alias for
   //   back-compat with any caller that hasn't migrated.
   async function partialWalkOnTerminal(currentTerminal, opts) {
+    // POST-TIER-9 FIX v9.3 (2026-05-24): fires BEFORE every target card walk.
+    //   - Walks 1-2 real action blocks forward (was 1-3).
+    //   - EDGE CASE: if all remaining non-fold non-allin actions are
+    //     street-closers (Call/Check that end the street), stop the action
+    //     walk early -- the line is over, no more advances inside this street.
+    //   - Always finishes with a category click + 10-20s settle wait.
+    //   Quota: 1 card commit + 1-2 actions = 2-3 /range/url calls per partial walk.
     opts = opts || {};
     try {
       if (modalKind() !== 'turn') return 0;
@@ -319,55 +326,59 @@
       const exclude = new Set(opts.excludeCards || []);
       const pool = cells.filter(c => c.status === 'ok' && !exclude.has(c.card));
       if (!pool.length) return 0;
-      // Pick ONE random card to walk into
       const pick = pool[Math.floor(Math.random() * pool.length)];
-      // Hover the cell briefly (1-2s) before clicking
       try {
         pick.el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
         pick.el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }));
       } catch (_) {}
       await sleep(1000 + Math.floor(Math.random() * 1000));
-      // Click the card (commits -> walker is on turn URL, modal closes)
-      let committed = false;
       try {
         await clickCardAndWait(pick.el, 'turn');
-        committed = true;
       } catch (e) {
-        // No-sim popup or other error -- dismiss and bail
         try { await dismissNoSimPopupIfAny(); } catch (_) {}
         return 0;
       }
-      // Wait 2-4s for trainer to settle after the commit
       await sleep(2000 + Math.floor(Math.random() * 2000));
-      // Walk 1-3 real action blocks forward
-      const nActions = 1 + Math.floor(Math.random() * 3); // 1-3
+      // Walk 1-2 real action blocks forward (with end-of-line edge case)
+      const nActions = 1 + Math.floor(Math.random() * 2); // 1-2
       let actionsWalked = 0;
+      const fakeTurnState = { street: 'turn' };
+      let endOfLine = false;
       for (let i = 0; i < nActions; i++) {
         const ab = await waitForActionPanelStable(4000, 500);
         if (!ab || ab.actions.length === 0) break;
-        // Pick a random enabled non-fold non-allin action
-        const candidates = ab.actions.filter(a => !a.disabled && a.label !== 'Fold' && a.label !== 'All-in');
-        if (!candidates.length) break;
+        // Candidates: not disabled, not Fold/All-in, AND NOT street-closers
+        //   Excluding closers keeps the partial walk inside the turn street.
+        const candidates = ab.actions.filter(a =>
+          !a.disabled &&
+          a.label !== 'Fold' &&
+          a.label !== 'All-in' &&
+          !isStreetCloser(a.label, fakeTurnState)
+        );
+        if (!candidates.length) {
+          // End of line -- no more intra-street advances. Stop walking.
+          endOfLine = true;
+          break;
+        }
         const action = candidates[Math.floor(Math.random() * candidates.length)];
         try {
           await clickActionAndWait(action.el, null, 4000);
           actionsWalked++;
-          // Wait 2-4s after click
           await sleep(2000 + Math.floor(Math.random() * 2000));
         } catch (_) { break; }
-        // Optional category click between actions
         if (i < nActions - 1) {
           try { await humanCategoryExploration(1); } catch (_) {}
         }
       }
-      // Final settle wait: 10-20 seconds (the "thinking" pause)
+      // ALWAYS finish with categories + settle, even after end-of-line break.
+      try { await humanCategoryExploration(1); } catch (_) {}
       await sleep(10000 + Math.floor(Math.random() * 10000));
-      // Stats
       window.__msHumanStats = window.__msHumanStats || { node_hovers: 0, category_bursts: 0, turn_hovers: 0, partial_browses: 0, partial_walks: 0 };
       window.__msHumanStats.partial_walks = (window.__msHumanStats.partial_walks || 0) + 1;
       window.__msLastPartialWalkCard = pick.card;
       window.__msLastPartialWalkTerminal = currentTerminal;
       window.__msLastPartialWalkActions = actionsWalked;
+      window.__msLastPartialWalkEndOfLine = endOfLine;
       return 1;
     } catch (e) {
       return 0;
@@ -670,16 +681,23 @@
     return modalKind() === null;
   }
   async function reopenChipModal(kind) {
+    // POST-TIER-9 FIX A (2026-05-24): retry chip search 4x with 500ms gaps
+    //   to tolerate DOM lag after deep walks + back-out collapse. Also
+    //   extend modal-open wait from 3s -> 5s for slow VPN renders.
     const re = kind === 'turn' ? /^[Tt]urn[2-9TJQKA]/ : /^[Rr]iver[2-9TJQKA]/;
-    const chip = $$('div').find(d => {
-      const cls = d.className?.toString() || '';
-      if (!/cursor-pointer/.test(cls) || !/rounded-md/.test(cls)) return false;
-      return re.test((d.textContent || '').replace(/\s+/g, ''));
-    });
+    let chip = null;
+    for (let attempt = 0; attempt < 4 && !chip; attempt++) {
+      chip = $$('div').find(d => {
+        const cls = d.className?.toString() || '';
+        if (!/cursor-pointer/.test(cls) || !/rounded-md/.test(cls)) return false;
+        return re.test((d.textContent || '').replace(/\s+/g, ''));
+      });
+      if (!chip && attempt < 3) await sleep(500);
+    }
     if (!chip) throw new Error(`no ${kind} chip`);
     chip.click();
     const t0 = Date.now();
-    while (Date.now() - t0 < 3000 && modalKind() !== kind) await sleep(100);
+    while (Date.now() - t0 < 5000 && modalKind() !== kind) await sleep(100);
     await sleep(200);
   }
 

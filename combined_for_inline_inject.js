@@ -1,14 +1,16 @@
 /* combined_for_inline_inject.js -- hand-scraper-postflop-flop-turn
  *
- * v9.1 (2026-05-24): hot-fix the partial-walk modal precondition.
- *   Orchestrator now calls ensureTurnModalAtTerminal() BEFORE firing
- *   partialWalkOnTerminal, since after pickCardCommit+dfsStreet the
- *   trainer is at ?turn=X with the modal closed. Without this reopen
- *   the partial walk returned 0 silently.
- *
- * v9 carried forward: always-click Categories tab, real partial walk
- * (1 card commit + 1-3 real action clicks + category clicks + 10-20s
- * wait), excludeCards protection, v8 producer/worker model, v4 timings.
+ * v9.3 (2026-05-24): partial walk fires BEFORE every target card walk
+ *   - Walker: partialWalkOnTerminal now walks 1-2 actions (was 1-3),
+ *     stops early if remaining non-fold-non-allin candidates are only
+ *     street closers (end-of-line), always finishes with category click +
+ *     10-20s settle.
+ *   - Orchestrator: removed post-card partial-walk. Added PRE-target
+ *     partial walk in cell loop -- fires before every target including
+ *     the first on a new terminal. excludeCards = entire explicitCards
+ *     list so partial walk never picks a target card.
+ *   - Cell loop early-exit + cheap-reopen retries + post-partial-walk
+ *     cleanup (v9.2) carried forward.
  */
 
 /* ==================== 1) WALKER ==================== */
@@ -325,6 +327,13 @@
   //   Old `pretendPartialBrowse` (hover-only) is kept as a thin alias for
   //   back-compat with any caller that hasn't migrated.
   async function partialWalkOnTerminal(currentTerminal, opts) {
+    // POST-TIER-9 FIX v9.3 (2026-05-24): fires BEFORE every target card walk.
+    //   - Walks 1-2 real action blocks forward (was 1-3).
+    //   - EDGE CASE: if all remaining non-fold non-allin actions are
+    //     street-closers (Call/Check that end the street), stop the action
+    //     walk early -- the line is over, no more advances inside this street.
+    //   - Always finishes with a category click + 10-20s settle wait.
+    //   Quota: 1 card commit + 1-2 actions = 2-3 /range/url calls per partial walk.
     opts = opts || {};
     try {
       if (modalKind() !== 'turn') return 0;
@@ -333,55 +342,59 @@
       const exclude = new Set(opts.excludeCards || []);
       const pool = cells.filter(c => c.status === 'ok' && !exclude.has(c.card));
       if (!pool.length) return 0;
-      // Pick ONE random card to walk into
       const pick = pool[Math.floor(Math.random() * pool.length)];
-      // Hover the cell briefly (1-2s) before clicking
       try {
         pick.el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
         pick.el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }));
       } catch (_) {}
       await sleep(1000 + Math.floor(Math.random() * 1000));
-      // Click the card (commits -> walker is on turn URL, modal closes)
-      let committed = false;
       try {
         await clickCardAndWait(pick.el, 'turn');
-        committed = true;
       } catch (e) {
-        // No-sim popup or other error -- dismiss and bail
         try { await dismissNoSimPopupIfAny(); } catch (_) {}
         return 0;
       }
-      // Wait 2-4s for trainer to settle after the commit
       await sleep(2000 + Math.floor(Math.random() * 2000));
-      // Walk 1-3 real action blocks forward
-      const nActions = 1 + Math.floor(Math.random() * 3); // 1-3
+      // Walk 1-2 real action blocks forward (with end-of-line edge case)
+      const nActions = 1 + Math.floor(Math.random() * 2); // 1-2
       let actionsWalked = 0;
+      const fakeTurnState = { street: 'turn' };
+      let endOfLine = false;
       for (let i = 0; i < nActions; i++) {
         const ab = await waitForActionPanelStable(4000, 500);
         if (!ab || ab.actions.length === 0) break;
-        // Pick a random enabled non-fold non-allin action
-        const candidates = ab.actions.filter(a => !a.disabled && a.label !== 'Fold' && a.label !== 'All-in');
-        if (!candidates.length) break;
+        // Candidates: not disabled, not Fold/All-in, AND NOT street-closers
+        //   Excluding closers keeps the partial walk inside the turn street.
+        const candidates = ab.actions.filter(a =>
+          !a.disabled &&
+          a.label !== 'Fold' &&
+          a.label !== 'All-in' &&
+          !isStreetCloser(a.label, fakeTurnState)
+        );
+        if (!candidates.length) {
+          // End of line -- no more intra-street advances. Stop walking.
+          endOfLine = true;
+          break;
+        }
         const action = candidates[Math.floor(Math.random() * candidates.length)];
         try {
           await clickActionAndWait(action.el, null, 4000);
           actionsWalked++;
-          // Wait 2-4s after click
           await sleep(2000 + Math.floor(Math.random() * 2000));
         } catch (_) { break; }
-        // Optional category click between actions
         if (i < nActions - 1) {
           try { await humanCategoryExploration(1); } catch (_) {}
         }
       }
-      // Final settle wait: 10-20 seconds (the "thinking" pause)
+      // ALWAYS finish with categories + settle, even after end-of-line break.
+      try { await humanCategoryExploration(1); } catch (_) {}
       await sleep(10000 + Math.floor(Math.random() * 10000));
-      // Stats
       window.__msHumanStats = window.__msHumanStats || { node_hovers: 0, category_bursts: 0, turn_hovers: 0, partial_browses: 0, partial_walks: 0 };
       window.__msHumanStats.partial_walks = (window.__msHumanStats.partial_walks || 0) + 1;
       window.__msLastPartialWalkCard = pick.card;
       window.__msLastPartialWalkTerminal = currentTerminal;
       window.__msLastPartialWalkActions = actionsWalked;
+      window.__msLastPartialWalkEndOfLine = endOfLine;
       return 1;
     } catch (e) {
       return 0;
@@ -684,16 +697,23 @@
     return modalKind() === null;
   }
   async function reopenChipModal(kind) {
+    // POST-TIER-9 FIX A (2026-05-24): retry chip search 4x with 500ms gaps
+    //   to tolerate DOM lag after deep walks + back-out collapse. Also
+    //   extend modal-open wait from 3s -> 5s for slow VPN renders.
     const re = kind === 'turn' ? /^[Tt]urn[2-9TJQKA]/ : /^[Rr]iver[2-9TJQKA]/;
-    const chip = $$('div').find(d => {
-      const cls = d.className?.toString() || '';
-      if (!/cursor-pointer/.test(cls) || !/rounded-md/.test(cls)) return false;
-      return re.test((d.textContent || '').replace(/\s+/g, ''));
-    });
+    let chip = null;
+    for (let attempt = 0; attempt < 4 && !chip; attempt++) {
+      chip = $$('div').find(d => {
+        const cls = d.className?.toString() || '';
+        if (!/cursor-pointer/.test(cls) || !/rounded-md/.test(cls)) return false;
+        return re.test((d.textContent || '').replace(/\s+/g, ''));
+      });
+      if (!chip && attempt < 3) await sleep(500);
+    }
     if (!chip) throw new Error(`no ${kind} chip`);
     chip.click();
     const t0 = Date.now();
-    while (Date.now() - t0 < 3000 && modalKind() !== kind) await sleep(100);
+    while (Date.now() - t0 < 5000 && modalKind() !== kind) await sleep(100);
     await sleep(200);
   }
 
@@ -1861,7 +1881,7 @@
   return 'multi-street helpers installed (window.__msHelpers) [v15 banner-only republish; v14 labelToTypeSize static-map fix; v13 plomm envelope support; v11 dynamic bet sizings]';
 })();
 
-/* ==================== 3) ORCHESTRATOR (v9.1 partial-walk modal reopen) ==================== */
+/* ==================== 3) ORCHESTRATOR ==================== */
 /* scrape_multistreet.js - flop+turn tree scraper for the PLO Master Mind
  * postflop trainer. Walks (flop -> every canonical turn under every flop
  * terminal), captures /range/url envelopes, decodes binary/plomm blobs,
@@ -2817,33 +2837,10 @@
           //   Lets human_like.partial_browse_chance control how often a
           //   between-card "looked at other cards" burst fires. Pure noise:
           //   no clicks on cards, no extra /range/url calls.
-          // POST-TIER-8 (2026-05-24) + v9 FIX (2026-05-24): real partial walk
-          //   between cards on the same terminal. Fires only if more
-          //   assigned cards remain. CRITICAL: ensureTurnModalAtTerminal()
-          //   MUST be called first because after pickCardCommit+dfsStreet
-          //   the trainer is at ?turn=X with the modal CLOSED. The partial
-          //   walk needs the modal OPEN to pick a random cell. Without the
-          //   reopen, partialWalkOnTerminal returns 0 silently.
-          try {
-            const _stillToWalk = (explicitCards || []).filter(
-              c => !(completedCardsPerTerminal[ft.terminal_node] || []).includes(c)
-            );
-            const pbChance = (humanCfg && typeof humanCfg.partial_browse_chance === 'number')
-              ? humanCfg.partial_browse_chance : 0;
-            if (_stillToWalk.length > 0 && pbChance > 0 && Math.random() < pbChance) {
-              // Reopen the turn modal at the terminal first (cheap path).
-              const _er = await ensureTurnModalAtTerminal();
-              if (_er.ok) {
-                const fn = (typeof W.partialWalkOnTerminal === 'function')
-                  ? W.partialWalkOnTerminal : W.pretendPartialBrowse;
-                if (typeof fn === 'function') {
-                  await fn(ft.terminal_node, { excludeCards: _stillToWalk });
-                }
-              } else {
-                result.warnings.push(`partial walk skipped at ${ft.terminal_node}: ensureTurnModalAtTerminal failed (${_er.path})`);
-              }
-            }
-          } catch (_) {}
+          // POST-TIER-9 v9.3 (2026-05-24): partial walk now fires BEFORE
+          //   each target card walk (in the cell loop), not after. The
+          //   old post-card partial-walk block was removed; this comment
+          //   marks the location for archaeology.
           if (!autoContinue) await pauseUntilContinue(`turn chunk emitted (${chunkZipName})`);
           return zipEntry;
         }
@@ -3103,6 +3100,15 @@
             log('quota_or_user_abort', { phase: 'cell_loop', terminal: ft.terminal_node });
             break;
           }
+          // POST-TIER-9 FIX B (2026-05-24): if explicitCards/targetList is set
+          //   AND every assigned card has been visited, exit immediately --
+          //   no point reopening the modal just to discover "no target left".
+          //   This eliminates one wasted reopen at the end of each terminal.
+          if (explicitCards && explicitCards.every(c => visitedThisTerminal.has(c))) {
+            terminalFullyDone = true;
+            terminalExitReason = 'all_targets_visited';
+            break;
+          }
           // PHASE 7: safety detection at safe boundary.
           //   If unexpected state (captcha, login redirect, page change),
           //   emit emergency-stop file + abort the run gracefully.
@@ -3209,6 +3215,28 @@
             break outer;
           }
           visitedThisTerminal.add(target.card);
+          // POST-TIER-9 v9.3 (2026-05-24): PRE-TARGET PARTIAL WALK.
+          //   Before each target card walk (including the first on a new
+          //   terminal), do a partial walk into a random non-target card's
+          //   subtree (1-2 actions + categories + 10-20s wait), then cheap-
+          //   reopen the modal so the real target walk proceeds normally.
+          //   excludeCards is the ENTIRE explicitCards list so the partial
+          //   walk can never pick a card we'll later try to walk for real.
+          try {
+            const pbChance = (humanCfg && typeof humanCfg.partial_browse_chance === 'number')
+              ? humanCfg.partial_browse_chance : 0;
+            if (pbChance > 0 && Math.random() < pbChance && typeof W.partialWalkOnTerminal === 'function') {
+              await W.partialWalkOnTerminal(ft.terminal_node, { excludeCards: explicitCards || [] });
+              // Cleanup: restore terminal + open modal so the upcoming
+              //   target commit proceeds without a forced full replay.
+              try {
+                const _stabOk = await stabilizeBackToTerminal(ft.terminal_node);
+                if (_stabOk) await W.reopenChipModal('turn');
+              } catch (e) {
+                result.warnings.push(`post-partial-walk cleanup at ${ft.terminal_node}: ${e.message}`);
+              }
+            }
+          } catch (_) {}
           // PHASE 4: hover 1-3 sibling cards before committing to target.
           //   No clicks -> no /range/url. Gated on cfg.human_like.turn_hover_count_range.
           try {
