@@ -15,19 +15,6 @@
  *     cfg.cached_flop_terminals so the next __scrapeMultiStreet call
  *     genuinely skips the flop DFS.
  *
- *   window.__msEmitResumeFile(eventLabel, downloadDelayMs)
- *     Builds a capsule and triggers a browser download of
- *     `<tree>_<flop>_resume_<eventLabel>.json`. Called automatically
- *     by the orchestrator after every zip emit. Can also be called
- *     manually from DevTools at any time.
- *
- *     POST-v18 BUG FIX (2026-05-20): refuses to emit if the checkpoint's
- *     flop does not match the URL's flop param. This catches the case
- *     where stale state from a prior run leaks into a fresh launch's
- *     first resume.json. Throws an Error with code
- *     MS_RESUME_FILE_FLOP_MISMATCH; the orchestrator catches it and
- *     pushes a warning into result.warnings.
- *
  * Also wraps __scrapeMultiStreet (and __scrapeResume if present) to
  * capture launch cfg + URL on window.__msLaunchCfg / window.__msLaunchUrl.
  *
@@ -175,90 +162,6 @@
   };
 
   // ---------------------------------------------------------------------
-  // 3) __msEmitResumeFile(eventLabel, downloadDelayMs)
-  //    Triggers a browser download of a JSON file named
-  //    <tree>_<flop>_resume_<eventLabel>.json containing the current capsule.
-  //    Called automatically by the v17 orchestrator after every zip emit.
-  // ---------------------------------------------------------------------
-  window.__msEmitResumeFile = async function(eventLabel, downloadDelayMs, opts) {
-    eventLabel = eventLabel || 'manual';
-    opts = opts || {};
-    const safeLabel = String(eventLabel).replace(/[^A-Za-z0-9_-]/g, '_');
-    downloadDelayMs = (typeof downloadDelayMs === 'number') ? downloadDelayMs : 250;
-
-    const capsuleObj = JSON.parse(window.__msDumpResumeCapsule({ silent: true }));
-    const tree = (capsuleObj.checkpoint && capsuleObj.checkpoint.tree) || 'UNKNOWN_TREE';
-    const flop = (capsuleObj.checkpoint && capsuleObj.checkpoint.flop) || 'UNKNOWN_FLOP';
-
-    // POST-v18 BUG FIX (flop-mismatch guard): if the in-memory checkpoint's
-    //   flop disagrees with the URL's flop, the capsule is carrying stale
-    //   state from a prior run and must NOT be written to disk. This is a
-    //   belt-and-suspenders check on top of the orchestrator's fresh-launch
-    //   state clear; refuse to emit and surface a loud warning instead.
-    let urlFlop = null;
-    try { urlFlop = new URL(location.href).searchParams.get('flop'); } catch (_) {}
-    if (urlFlop && flop && urlFlop !== flop) {
-      const msg = `[hand-scraper] __msEmitResumeFile REFUSED: checkpoint.flop=${flop} but URL flop=${urlFlop} (stale checkpoint from a prior run). No resume.json emitted for event '${eventLabel}'.`;
-      try { console.warn(msg); } catch (_) {}
-      const err = new Error(msg);
-      err.code = 'MS_RESUME_FILE_FLOP_MISMATCH';
-      throw err;
-    }
-
-    // PHASE 1: per-card naming when opts identifies a single (terminal, card)
-    //   in zip_per_card mode. JSON payload also gets device + session_id +
-    //   session_meta so downstream tooling can attribute the capsule without
-    //   re-parsing the filename.
-    let fileName;
-    if (opts.zip_per_card && opts.terminal && opts.card) {
-      const safeTerm = String(opts.terminal).replace(/[^A-Za-z0-9_-]/g, '_');
-      const safeCard = String(opts.card).replace(/[^A-Za-z0-9_-]/g, '_');
-      const safeDev  = String(opts.device || 'unknown').replace(/[^A-Za-z0-9_-]/g, '_');
-      fileName = `${tree}_${flop}_${safeTerm}_${safeCard}_${safeDev}_resume.json`;
-      capsuleObj.device = opts.device || null;
-      capsuleObj.session_id = opts.session_id || null;
-      capsuleObj.session_emitted_at = new Date().toISOString();
-      capsuleObj.session_meta = {
-        terminal: opts.terminal,
-        card: opts.card,
-        device: opts.device || null,
-        session_id: opts.session_id || null,
-      };
-    } else {
-      fileName = `${tree}_${flop}_resume_${safeLabel}.json`;
-    }
-    const capsuleStr = JSON.stringify(capsuleObj, null, 2);
-
-    try {
-      const blob = new Blob([capsuleStr], { type: 'application/json' });
-      const dlUrl = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = dlUrl;
-      a.download = fileName;
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(() => { a.remove(); URL.revokeObjectURL(dlUrl); }, 1000);
-    } catch (e) {
-      console.warn('[hand-scraper v17] __msEmitResumeFile: download failed:', e && e.message);
-      throw e;
-    }
-
-    // Track the emitted resume files on a registry, like __msAllZips.
-    if (!Array.isArray(window.__msAllResumeFiles)) window.__msAllResumeFiles = [];
-    window.__msAllResumeFiles.push({
-      name: fileName,
-      bytes: capsuleStr.length,
-      event: eventLabel,
-      t: Date.now(),
-    });
-
-    if (downloadDelayMs > 0) {
-      await new Promise(r => setTimeout(r, downloadDelayMs));
-    }
-    return { name: fileName, bytes: capsuleStr.length };
-  };
-
-  // ---------------------------------------------------------------------
   // 4) __msApplyResumeCapsule(capsuleJsonOrObj)
   // ---------------------------------------------------------------------
   window.__msApplyResumeCapsule = function(capsule) {
@@ -357,7 +260,6 @@
     if (typeof lcfg.node_wait_max_ms === 'number')     wiz.cfg.node_wait_max_ms     = lcfg.node_wait_max_ms;
     if (typeof lcfg.auto_continue === 'boolean')       wiz.cfg.auto_continue        = lcfg.auto_continue;
     if (typeof lcfg.download_delay_ms === 'number')    wiz.cfg.download_delay_ms    = lcfg.download_delay_ms;
-    if (typeof lcfg.emit_resume_file === 'boolean')    wiz.cfg.emit_resume_file     = lcfg.emit_resume_file;
 
     return {
       cfg: wiz.cfg,
@@ -373,11 +275,10 @@
   };
 
   window.__msV17ExtensionInstalled = true;
-  window.__msResumeFileFlopGuardInstalled = true;
   window.__msPhase1ResumeFileOptsInstalled = true;
   window.__msPhase2CapsuleSummaryInstalled = true;
   try {
-    console.log('[hand-scraper v17] capsule extension installed (__msDumpResumeCapsule, __msApplyResumeCapsule, __msEmitResumeFile + post-v18 flop-mismatch guard). Pauses still come from v15; Claude must NEVER auto-continue them.');
+    console.log('[hand-scraper v17/v9.7.1] capsule extension installed (__msDumpResumeCapsule, __msApplyResumeCapsule). __msEmitResumeFile removed in v9.7.1. Pauses still come from v15; Claude must NEVER auto-continue them.');
   } catch (_) {}
   return { v17_extension_loaded: true };
 })();

@@ -7,23 +7,20 @@
  * Requires window.__W (walker) and window.__msHelpers to be installed first.
  *
  * POST-v18 CHANGES — checkpoint hygiene bug fixes (2026-05-20)
- *   - FLOP EMIT ORDER: __msEmitResumeFile('after_flop_zip') now fires AFTER
- *     saveCheckpoint(), matching the turn-chunk path. Previously the inverted
- *     order let stale window.__msCheckpoint / localStorage state from a prior
- *     run leak into the new run's first resume.json (mismatched flop names
- *     between the freshly-emitted zip and the resume.json checkpoint).
  *   - FRESH-LAUNCH STATE CLEAR: every non-resume invocation now clears
- *     window.__msCheckpoint, localStorage __msCheckpoint_v15,
- *     window.__msCachedFlopTerminals, and window.__msAllResumeFiles at
- *     startup. Resume invocations (cfg.skip_flop_walk === true) preserve
- *     prior state because that IS the work being resumed.
+ *     window.__msCheckpoint, localStorage __msCheckpoint_v15, and
+ *     window.__msCachedFlopTerminals at startup. Resume invocations
+ *     (cfg.skip_flop_walk === true) preserve prior state because that IS
+ *     the work being resumed.
+ *   - v9.7.1 (2026-05-24): __msEmitResumeFile + per-card resume.json files
+ *     removed entirely; session_record.json is the only artifact written at
+ *     session end (by __scrapeSession via __msBuildSessionRecord +
+ *     __msEmitSessionRecord).
  *
- * v17 CHANGES — genuine flop-walk skip + auto resume.json + byte-threshold + bug fix
+ * v17 CHANGES — genuine flop-walk skip + byte-threshold + bug fix
  *   - cfg.skip_flop_walk + cfg.cached_flop_terminals: bypass the flop DFS on
- *     resume. The resume.json file (auto-emitted alongside every zip) carries
- *     the terminal structure forward across tabs/chats.
- *   - cfg.emit_resume_file (default true): trigger a JSON download alongside
- *     every zip, containing a full v1 capsule + cached_flop_terminals.
+ *     resume. (In v9.7.1 the cached terminals are carried by the workload JSON
+ *     and session_record.json rather than a per-zip resume.json file.)
  *   - cfg.chunk_max_raw_bytes (default Infinity): OR trigger alongside
  *     turn_cards_per_chunk. Whichever fires first emits the chunk.
  *   - BUG FIX: completedTerminals only populated when the cell loop exits
@@ -354,11 +351,11 @@
     //      turn loop without re-walking the flop DFS or re-emitting the flop zip.
     const skipFlopWalk = cfg.skip_flop_walk === true &&
       Array.isArray(cfg.cached_flop_terminals) && cfg.cached_flop_terminals.length > 0;
-    // v17: emit a resume.json file alongside every zip download by default.
-    //      Set cfg.emit_resume_file: false to disable. The file is a full v1
-    //      capsule with cached_flop_terminals baked in, so a future resume can
-    //      genuinely skip the flop walk.
-    const emitResumeFile = cfg.emit_resume_file !== false;
+    // v9.7.1 (2026-05-24): per-card resume.json files removed entirely.
+    //   session_record.json is the only artifact emitted at session end (by
+    //   __scrapeSession via __msBuildSessionRecord + __msEmitSessionRecord).
+    //   Cross-chat handoff still works via __msDumpResumeCapsule (in-memory
+    //   capsule, no file emission).
 
     window.__msProgress = {
       phase: 'starting', t_start: Date.now(),
@@ -392,7 +389,6 @@
       window.__msCheckpoint = null;
       try { localStorage.removeItem(CHECKPOINT_KEY); } catch (_) {}
       window.__msCachedFlopTerminals = null;
-      window.__msAllResumeFiles = [];
     }
     if (typeof H.resetZipCompressionState === 'function') {
       H.resetZipCompressionState();
@@ -572,23 +568,10 @@
             result.flop_zip_emitted_at = new Date().toISOString();
           }
           log('flop_zip_emitted', { name: flopZipName, files: zipEntry?.files });
-          // POST-v18 BUG FIX (flop emit order): checkpoint MUST be saved BEFORE
-          //   __msEmitResumeFile so the resume.json captures this-run state, not
-          //   leftover state from a prior run. The turn-chunk path below was
-          //   already in the correct order; only the flop path was inverted.
+          // v9.7.1: per-card resume.json removed. Checkpoint still saved
+          //   (for in-memory __msDumpResumeCapsule).
           saveCheckpoint(buildCheckpoint({ last_event: 'flop_zip_emitted', last_zip: flopZipName }));
-          // v17: emit resume.json alongside the flop zip (now reads the
-          //   just-saved checkpoint).
-          // POST-TIER-5 (2026-05-23): skip resume_after_flop_zip.json when in
-          //   producer mode -- the workload JSONs carry the resume info.
           const _producerMode = (cfg.skip_workload_emission !== true) && (cfg.scope === 'flop+turn');
-          if (!_producerMode && emitResumeFile && typeof window.__msEmitResumeFile === 'function') {
-            try {
-              await window.__msEmitResumeFile('after_flop_zip', downloadDelayMs);
-            } catch (e) {
-              result.warnings.push(`emit_resume_file (after_flop_zip) failed: ${e.message}`);
-            }
-          }
 
           // POST-TIER-5 (2026-05-23): EMIT N WORKLOAD JSONS WITH 100% COVERAGE.
           //   For each terminal, shuffle the walkable cards and distribute
@@ -751,16 +734,9 @@
         }
       }
       if (skipFlopWalk) {
-        // No flop zip emitted this run; still save a checkpoint snapshot so the
-        // resume.json reflects "we resumed and skipped the flop walk".
+        // v9.7.1: per-card resume.json removed. Checkpoint still saved
+        //   (for in-memory __msDumpResumeCapsule).
         saveCheckpoint(buildCheckpoint({ last_event: 'flop_walk_skipped_on_resume' }));
-        if (emitResumeFile && typeof window.__msEmitResumeFile === 'function') {
-          try {
-            await window.__msEmitResumeFile('after_flop_walk_skipped', downloadDelayMs);
-          } catch (e) {
-            result.warnings.push(`emit_resume_file (after_flop_walk_skipped) failed: ${e.message}`);
-          }
-        }
       }
 
       if (scope === 'flop') {
@@ -936,33 +912,8 @@
           chunkState.contents = [];
           // v15: checkpoint + pause after each chunk zip.
           saveCheckpoint(buildCheckpoint({ last_event: 'turn_chunk_emitted', last_zip: chunkZipName, last_terminal: ft.terminal_node }));
-          // v17 + PHASE 1: emit resume.json alongside the chunk zip.
-          //   Legacy: event = `after_<terminal>_chunk<NNN>`; flat filename.
-          //   Phase 1 (zipPerCard): event = `after_<terminal>_<card>`; filename
-          //   becomes `<tree>_<flop>_<terminal>_<card>_<device>_resume.json` and
-          //   the JSON payload is augmented with device/session_id/session_meta.
-          if (emitResumeFile && typeof window.__msEmitResumeFile === 'function') {
-            try {
-              const safeFt = ft.terminal_node.replace(/[^A-Za-z0-9_-]/g, '_');
-              if (zipPerCard && cardForName) {
-                await window.__msEmitResumeFile(
-                  `after_${safeFt}_${cardForName}`,
-                  downloadDelayMs,
-                  {
-                    zip_per_card: true,
-                    terminal: ft.terminal_node,
-                    card: cardForName,
-                    device: deviceName,
-                    session_id: sessionId,
-                  }
-                );
-              } else {
-                await window.__msEmitResumeFile(`after_${safeFt}_chunk${idxStr}`, downloadDelayMs);
-              }
-            } catch (e) {
-              result.warnings.push(`emit_resume_file (chunk ${chunkZipName}) failed: ${e.message}`);
-            }
-          }
+          // v9.7.1: per-card resume.json removed. Checkpoint above still saved
+          //   so __msDumpResumeCapsule can produce a paste-capsule on demand.
           // TIER 2 FIX #5: optional partial-browse noise BEFORE the pause.
           //   Lets human_like.partial_browse_chance control how often a
           //   between-card "looked at other cards" burst fires. Pure noise:
@@ -1513,6 +1464,105 @@
   //
   // Returns the __scrapeMultiStreet result, with session_summary appended.
   // ---------------------------------------------------------------------
+  // ============== v9.7 (2026-05-24) SESSION RECORD HELPERS ==============
+  // Replaces per-card resume.json emission. __scrapeSession calls
+  // __msBuildSessionRecord(spec, cfg, result) -> rec, then
+  // __msEmitSessionRecord(rec) to download <session_id>.json. The schema
+  // matches what cloud_sync/ledger.py finalize-session ingests:
+  //   schema_version, session_id, device, tree, flop, started_at,
+  //   finished_at, elapsed_s, exit_reason, cards_planned, cards_walked,
+  //   cards_per_terminal, aliases, dim_cards, zips_emitted,
+  //   flop_zip_emitted_this_session, captures,
+  //   partial_walk_alias_recoveries, human_stats, warnings,
+  //   workloads_drawn_from, session_kind.
+  window.__msBuildSessionRecord = function(spec, cfg, result) {
+    spec = spec || {}; cfg = cfg || {}; result = result || {};
+    const cardsPerTerm = {};
+    const zipNames = [];
+    let flopZipEmittedThisSession = false;
+    for (const z of (result.zips || result.zips_emitted || [])) {
+      const name = (typeof z === 'string') ? z : (z && z.name);
+      if (!name) continue;
+      zipNames.push(name);
+      const base = name.replace(/\.zip$/, '');
+      if (base.endsWith('_flop')) { flopZipEmittedThisSession = true; continue; }
+      let stripped = base;
+      if (result.tree && result.flop) {
+        const pfx = result.tree + '_' + result.flop + '_';
+        if (stripped.indexOf(pfx) === 0) stripped = stripped.slice(pfx.length);
+      }
+      const idx = stripped.lastIndexOf('_');
+      if (idx === -1) continue;
+      const terminal = stripped.slice(0, idx);
+      const card = stripped.slice(idx + 1);
+      (cardsPerTerm[terminal] = cardsPerTerm[terminal] || []).push(card);
+    }
+    const aliases = (result.aliases || []).map(function(a) {
+      return {
+        terminal: a.terminal || a.flop_terminal,
+        requested: a.requested,
+        canonical: a.canonical,
+        suitMap: a.suitMap,
+      };
+    });
+    const exit_reason = window.__msEmergencyStop ? 'emergency_stop'
+                      : (result.aborted_due_to_quota || window.__msQuotaExceeded) ? 'quota_exceeded'
+                      : (result.aborted_by_user || window.__msAborted) ? 'user_abort'
+                      : (result.error ? 'error' : 'session_complete');
+    const cards_walked_n = Object.values(cardsPerTerm).reduce(function(s, a) { return s + a.length; }, 0);
+    const captures_n = zipNames.length - (flopZipEmittedThisSession ? 1 : 0);
+    let cards_planned_n;
+    if (Array.isArray(spec.cards)) cards_planned_n = spec.cards.length;
+    else if (cfg.target_cards_per_terminal) {
+      cards_planned_n = Object.values(cfg.target_cards_per_terminal)
+        .reduce(function(s, a) { return s + (Array.isArray(a) ? a.length : 0); }, 0);
+    } else cards_planned_n = zipNames.length;
+    return {
+      schema_version: '1',
+      session_id: cfg.session_id || ('ses-' + (result.tree || 'unknown') + '-' + Date.now()),
+      device: cfg.device_name || 'main',
+      tree: result.tree,
+      flop: result.flop,
+      started_at: spec.started_at || result.started_at,
+      finished_at: result.finished_at,
+      elapsed_s: result.elapsed_s,
+      exit_reason: exit_reason,
+      cards_planned: cards_planned_n,
+      cards_walked: cards_walked_n,
+      cards_per_terminal: cardsPerTerm,
+      aliases: aliases,
+      dim_cards: result.dim_cards_per_terminal || {},
+      zips_emitted: zipNames,
+      flop_zip_emitted_this_session: flopZipEmittedThisSession,
+      captures: captures_n,
+      partial_walk_alias_recoveries: window.__msPartialWalkAliasRecoveries || 0,
+      human_stats: Object.assign({}, window.__msHumanStats || {}, {
+        node_wait_stats: window.__msNodeWaitStats || {},
+      }),
+      warnings: result.warnings || [],
+      workloads_drawn_from: cfg.workloads_drawn_from || spec.workloads_drawn_from || [],
+      session_kind: spec.session_kind || 'scrape',
+    };
+  };
+  window.__msEmitSessionRecord = function(rec) {
+    try {
+      const blob = new Blob([JSON.stringify(rec, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = rec.session_id + '.json';
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function() { URL.revokeObjectURL(url); a.remove(); }, 30000);
+      return true;
+    } catch (e) {
+      try { console.warn('[v9.7] __msEmitSessionRecord failed:', e && e.message); } catch (_) {}
+      return false;
+    }
+  };
+  window.__msV97SessionRecordInstalled = true;
+
   if (typeof window.__scrapeSession !== 'function') {
     window.__scrapeSession = async function(spec) {
       spec = spec || {};
@@ -1568,10 +1618,22 @@
         aborted_due_to_quota: !!result.aborted_due_to_quota,
       };
       window.__msSessionResult = result;
+      // v9.7 (2026-05-24): emit a single session_record.json at session end.
+      // Schema matches cloud_sync/ledger.py finalize-session. Replaces the
+      // per-card resume.json files that were emitted in v9.6 and earlier.
+      try {
+        spec.started_at = sessionStartedAt;
+        const rec = window.__msBuildSessionRecord(spec, cfg, result);
+        window.__msEmitSessionRecord(rec);
+        result.session_record_emitted = rec.session_id + '.json';
+      } catch (e) {
+        result.warnings = result.warnings || [];
+        result.warnings.push('session_record_emit_failed: ' + (e && e.message));
+      }
       return result;
     };
   }
 
-  return 'multi-street scraper installed (window.__scrapeMultiStreet, window.__scrapeSession) [tier 2/3 orch: categories-activate + partial-browse + shuffle_cards; tier-1 fixes: all-terminals-cached + per-card-manifest + modal-cleanup; phase 7 emergency-stop hook; phase 4 human-like noise wired (cfg.human_like -> window.__msHumanCfg + turn hover hook); phase 3 session wrapper; phase 2 card maps + target_cards_per_terminal; phase 1 session mode (zip_per_card + device_name + session_id); post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + emit_resume_file + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
+  return 'multi-street scraper installed (window.__scrapeMultiStreet, window.__scrapeSession) [v9.7.1 session-record-only emit, __msEmitResumeFile removed; v9.7 session-record-emit; tier 2/3 orch: categories-activate + partial-browse + shuffle_cards; tier-1 fixes: all-terminals-cached + per-card-manifest + modal-cleanup; phase 7 emergency-stop hook; phase 4 human-like noise wired (cfg.human_like -> window.__msHumanCfg + turn hover hook); phase 3 session wrapper; phase 2 card maps + target_cards_per_terminal; phase 1 session mode (zip_per_card + device_name + session_id); post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
 })();
 
