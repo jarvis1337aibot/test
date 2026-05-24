@@ -1,20 +1,24 @@
 /* combined_for_inline_inject.js -- hand-scraper-postflop-flop-turn
  *
- * v8 (2026-05-23): inline turn-modal capture during flop DFS
+ * v9 (2026-05-24): walker fixes layer on top of v8 producer/worker model
  *
- *   Walker now opens the turn modal at each terminal during the flop walk
- *   itself (when a closer action is reached), captures cells, closes, and
- *   continues. Replaces the orchestrator's separate post-walk replay pass
- *   (saves ~50-100s per producer run; same correctness).
+ *   Walker fixes:
+ *     - activateCategoriesTab(): ALWAYS click the tab; don't trust the
+ *       "already activated" cache or the panel-locator pre-check. Wait
+ *       up to 3s for the panel to render.
+ *     - partialWalkOnTerminal(): REAL partial walk between cards on the
+ *       same terminal. Picks a random ok-status cell NOT in the still-
+ *       to-walk assigned list, commits it, walks 1-3 real action blocks
+ *       forward (with category clicks between), waits 10-20s.
+ *       Quota: 2-4 /range/url calls per partial walk. Fires only when
+ *       more assigned cards remain on the terminal.
  *
- *   v7 producer/worker model: flop walk -> N workload JSONs (5-40% per
- *     terminal, summing to 100% coverage, slim schema, url field) -> STOP.
- *     Producer skips resume_after_flop_zip.json (workloads carry resume info).
- *
- *   v4 timings carried forward (2-4s inter-node, 2-4s nav pacing).
+ *   v8 carried forward: producer/worker model, inline modal capture in
+ *   flop DFS, 100% coverage workload partitions, 5-40% per workload,
+ *   slim schema, url field, v4 timings (2-4s).
  */
 
-/* ==================== 1) WALKER (v8 inline modal capture) ==================== */
+/* ==================== 1) WALKER (v9 fixes) ==================== */
 /* multi_street_walker.js - DOM-only walker for the PLO Master Mind postflop trainer.
  *
  * Installs window.__W with primitives for DFS, modal handling, alias-aware card
@@ -269,13 +273,13 @@
   //   Clicking the nearest clickable ancestor activates the tab.
   //   Idempotent via window.__msCategoriesTabActivated.
   async function activateCategoriesTab() {
-    if (window.__msCategoriesTabActivated) return true;
+    // POST-TIER-8 FIX (2026-05-24): ALWAYS click the Categories tab when
+    //   this is called -- don't trust the cached "already activated" flag
+    //   or the panel-locator pre-check. Empirically the panel can appear
+    //   locatable while still being dim/empty; the click is idempotent
+    //   when the tab is genuinely already active, and necessary when it's
+    //   not. Wait long enough for the panel to render before returning.
     try {
-      // If the Categories panel is already locatable, the tab is active.
-      if (_msFindCategoriesPanel()) {
-        window.__msCategoriesTabActivated = true;
-        return true;
-      }
       const catLabel = [...document.querySelectorAll('*')].find(
         e => (e.textContent || '').trim() === 'Categories' && e.children.length === 0
       );
@@ -292,54 +296,108 @@
       }
       if (!clickable) clickable = catLabel.parentElement;
       if (!clickable) return false;
-      clickable.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-      await sleep(150 + Math.floor(Math.random() * 250));
-      clickable.click();
-      await sleep(600 + Math.floor(Math.random() * 600));
-      const ok = !!_msFindCategoriesPanel();
-      window.__msCategoriesTabActivated = ok;
-      return ok;
+      try {
+        clickable.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+        await sleep(150 + Math.floor(Math.random() * 250));
+        clickable.click();
+        // Also dispatch a synthetic MouseEvent click for picky frameworks
+        clickable.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      } catch (_) {}
+      // Wait for the panel to render. Up to ~3s in 200ms steps.
+      let panel = null;
+      for (let attempt = 0; attempt < 15; attempt++) {
+        await sleep(200);
+        panel = _msFindCategoriesPanel();
+        if (panel) break;
+      }
+      window.__msCategoriesTabActivated = !!panel;
+      return !!panel;
     } catch (e) {
       return false;
     }
   }
 
-  // TIER 2 FIX #5: pretendPartialBrowse -- pure-noise hover-only browse of
-  //   the currently-open turn modal. Hovers 3-5 random non-used cells with
-  //   small dwell pauses, optionally triggers a small category burst. NEVER
-  //   clicks a card (zero /range/url calls). Caller passes currentTerminal
-  //   so it can be logged.
-  async function pretendPartialBrowse(currentTerminal) {
+  // POST-TIER-8 (2026-05-24): partialWalkOnTerminal -- REAL partial walk
+  //   between cards on the same terminal. Picks a random ok-status turn
+  //   cell (excluding opts.excludeCards which are still-to-walk assigned
+  //   cards), commits it, walks 1-3 real action blocks forward (with a
+  //   category burst between each), then waits 10-20s. After this returns
+  //   the trainer is in an arbitrary state inside the partial card's
+  //   subtree; the orchestrator's ensureTurnModalAtTerminal() handles
+  //   navigating back to the terminal modal for the next real card.
+  //
+  //   Quota cost per partial walk: 1 (card commit) + 1-3 (action clicks)
+  //   = 2-4 /range/url calls. Categories clicks are free.
+  //
+  //   Old `pretendPartialBrowse` (hover-only) is kept as a thin alias for
+  //   back-compat with any caller that hasn't migrated.
+  async function partialWalkOnTerminal(currentTerminal, opts) {
+    opts = opts || {};
     try {
       if (modalKind() !== 'turn') return 0;
       const cells = readModalCells('turn');
       if (!cells.length) return 0;
-      const pool = cells.filter(c => c.status === 'ok');
+      const exclude = new Set(opts.excludeCards || []);
+      const pool = cells.filter(c => c.status === 'ok' && !exclude.has(c.card));
       if (!pool.length) return 0;
-      const k = 3 + Math.floor(Math.random() * 3); // 3-5
-      const picks = [];
-      const poolCopy = pool.slice();
-      for (let i = 0; i < k && poolCopy.length; i++) {
-        picks.push(poolCopy.splice(Math.floor(Math.random() * poolCopy.length), 1)[0]);
+      // Pick ONE random card to walk into
+      const pick = pool[Math.floor(Math.random() * pool.length)];
+      // Hover the cell briefly (1-2s) before clicking
+      try {
+        pick.el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+        pick.el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }));
+      } catch (_) {}
+      await sleep(1000 + Math.floor(Math.random() * 1000));
+      // Click the card (commits -> walker is on turn URL, modal closes)
+      let committed = false;
+      try {
+        await clickCardAndWait(pick.el, 'turn');
+        committed = true;
+      } catch (e) {
+        // No-sim popup or other error -- dismiss and bail
+        try { await dismissNoSimPopupIfAny(); } catch (_) {}
+        return 0;
       }
-      for (const cell of picks) {
-        if (!cell.el) continue;
+      // Wait 2-4s for trainer to settle after the commit
+      await sleep(2000 + Math.floor(Math.random() * 2000));
+      // Walk 1-3 real action blocks forward
+      const nActions = 1 + Math.floor(Math.random() * 3); // 1-3
+      let actionsWalked = 0;
+      for (let i = 0; i < nActions; i++) {
+        const ab = await waitForActionPanelStable(4000, 500);
+        if (!ab || ab.actions.length === 0) break;
+        // Pick a random enabled non-fold non-allin action
+        const candidates = ab.actions.filter(a => !a.disabled && a.label !== 'Fold' && a.label !== 'All-in');
+        if (!candidates.length) break;
+        const action = candidates[Math.floor(Math.random() * candidates.length)];
         try {
-          cell.el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-          cell.el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }));
-        } catch (_) {}
-        await sleep(600 + Math.floor(Math.random() * 1400));
+          await clickActionAndWait(action.el, null, 4000);
+          actionsWalked++;
+          // Wait 2-4s after click
+          await sleep(2000 + Math.floor(Math.random() * 2000));
+        } catch (_) { break; }
+        // Optional category click between actions
+        if (i < nActions - 1) {
+          try { await humanCategoryExploration(1); } catch (_) {}
+        }
       }
-      // Optional category nudge during the browse (50% chance).
-      if (Math.random() < 0.5) {
-        try { await humanCategoryExploration(1); } catch (_) {}
-      }
-      window.__msHumanStats = window.__msHumanStats || { node_hovers: 0, category_bursts: 0, turn_hovers: 0, partial_browses: 0 };
-      window.__msHumanStats.partial_browses = (window.__msHumanStats.partial_browses || 0) + 1;
-      return picks.length;
+      // Final settle wait: 10-20 seconds (the "thinking" pause)
+      await sleep(10000 + Math.floor(Math.random() * 10000));
+      // Stats
+      window.__msHumanStats = window.__msHumanStats || { node_hovers: 0, category_bursts: 0, turn_hovers: 0, partial_browses: 0, partial_walks: 0 };
+      window.__msHumanStats.partial_walks = (window.__msHumanStats.partial_walks || 0) + 1;
+      window.__msLastPartialWalkCard = pick.card;
+      window.__msLastPartialWalkTerminal = currentTerminal;
+      window.__msLastPartialWalkActions = actionsWalked;
+      return 1;
     } catch (e) {
       return 0;
     }
+  }
+
+  // Back-compat alias: pretendPartialBrowse now delegates to partialWalkOnTerminal.
+  async function pretendPartialBrowse(currentTerminal, opts) {
+    return partialWalkOnTerminal(currentTerminal, opts || {});
   }
 
   async function humanCategoryExploration(k) {
@@ -1138,13 +1196,14 @@
     maybeHumanLikeNoiseBetweenNodes,
     // PHASE 7
     detectUnexpectedState, emitEmergencyStopFile,
-    // TIER 2
-    activateCategoriesTab, pretendPartialBrowse,
+    // TIER 2 + POST-TIER-8
+    activateCategoriesTab, pretendPartialBrowse, partialWalkOnTerminal,
   };
   window.__msV18WalkerInstalled = true;
   window.__msPhase4HumanLikeInstalled = true;
   window.__msPhase7SafetyInstalled = true;
   window.__msInlineModalCaptureInstalled = true; // 2026-05-23 v7: inline turn-modal capture in flop DFS
+  window.__msPostTier8WalkerInstalled = true; // 2026-05-24 v8: always-click Categories tab + real partial walk
   window.__msTier2NoiseInstalled = true;
   return 'multi-street walker installed (window.__W) [tier 2 noise: categories-tab activate + partial-browse; phase 7 safety detect + emergency stop emit; phase 4 human-like noise (long pauses + hover bursts + category exploration); v18 all-in no-descend + back-out chain collapse; v15 random 3-5s inter-node wait; v13 plomm envelope support; v11 dynamic bet sizings + 1/5 pot static]';
 })();
@@ -1809,7 +1868,7 @@
   return 'multi-street helpers installed (window.__msHelpers) [v15 banner-only republish; v14 labelToTypeSize static-map fix; v13 plomm envelope support; v11 dynamic bet sizings]';
 })();
 
-/* ==================== 3) ORCHESTRATOR (v7 producer + workload partition) ==================== */
+/* ==================== 3) ORCHESTRATOR (v9 real partial walk wiring) ==================== */
 /* scrape_multistreet.js - flop+turn tree scraper for the PLO Master Mind
  * postflop trainer. Walks (flop -> every canonical turn under every flop
  * terminal), captures /range/url envelopes, decodes binary/plomm blobs,
@@ -2765,11 +2824,24 @@
           //   Lets human_like.partial_browse_chance control how often a
           //   between-card "looked at other cards" burst fires. Pure noise:
           //   no clicks on cards, no extra /range/url calls.
+          // POST-TIER-8 (2026-05-24): real partial walk between cards on the
+          //   same terminal. Fires only if there are MORE assigned cards
+          //   left to walk on this terminal (no point doing noise before
+          //   switching terminals). Passes the still-to-walk list as
+          //   excludeCards so the partial walk picks a card we won't
+          //   later try to walk for real (avoids 'used'-status conflict).
           try {
+            const _stillToWalk = (explicitCards || []).filter(
+              c => !(completedCardsPerTerminal[ft.terminal_node] || []).includes(c)
+            );
             const pbChance = (humanCfg && typeof humanCfg.partial_browse_chance === 'number')
               ? humanCfg.partial_browse_chance : 0;
-            if (pbChance > 0 && Math.random() < pbChance && typeof W.pretendPartialBrowse === 'function') {
-              await W.pretendPartialBrowse(ft.terminal_node);
+            if (_stillToWalk.length > 0 && pbChance > 0 && Math.random() < pbChance) {
+              const fn = (typeof W.partialWalkOnTerminal === 'function')
+                ? W.partialWalkOnTerminal : W.pretendPartialBrowse;
+              if (typeof fn === 'function') {
+                await fn(ft.terminal_node, { excludeCards: _stillToWalk });
+              }
             }
           } catch (_) {}
           if (!autoContinue) await pauseUntilContinue(`turn chunk emitted (${chunkZipName})`);

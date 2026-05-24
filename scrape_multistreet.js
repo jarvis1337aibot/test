@@ -953,11 +953,24 @@
           //   Lets human_like.partial_browse_chance control how often a
           //   between-card "looked at other cards" burst fires. Pure noise:
           //   no clicks on cards, no extra /range/url calls.
+          // POST-TIER-8 (2026-05-24): real partial walk between cards on the
+          //   same terminal. Fires only if there are MORE assigned cards
+          //   left to walk on this terminal (no point doing noise before
+          //   switching terminals). Passes the still-to-walk list as
+          //   excludeCards so the partial walk picks a card we won't
+          //   later try to walk for real (avoids 'used'-status conflict).
           try {
+            const _stillToWalk = (explicitCards || []).filter(
+              c => !(completedCardsPerTerminal[ft.terminal_node] || []).includes(c)
+            );
             const pbChance = (humanCfg && typeof humanCfg.partial_browse_chance === 'number')
               ? humanCfg.partial_browse_chance : 0;
-            if (pbChance > 0 && Math.random() < pbChance && typeof W.pretendPartialBrowse === 'function') {
-              await W.pretendPartialBrowse(ft.terminal_node);
+            if (_stillToWalk.length > 0 && pbChance > 0 && Math.random() < pbChance) {
+              const fn = (typeof W.partialWalkOnTerminal === 'function')
+                ? W.partialWalkOnTerminal : W.pretendPartialBrowse;
+              if (typeof fn === 'function') {
+                await fn(ft.terminal_node, { excludeCards: _stillToWalk });
+              }
             }
           } catch (_) {}
           if (!autoContinue) await pauseUntilContinue(`turn chunk emitted (${chunkZipName})`);
