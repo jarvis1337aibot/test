@@ -173,6 +173,7 @@
     let t0 = Date.now();
     while (Date.now() - t0 < 4000 && W.urlNode() === before) await sleep(100);
     while (Date.now() - t0 < 6000 && !W.modalKind()) await sleep(100);
+    if (W.modalKind()) { await sleep(2000 + Math.floor(Math.random() * 2000)); }
     return !!W.modalKind();
   }
 
@@ -513,6 +514,54 @@
         } catch (_) { /* defensive */ }
       }
 
+      // POST-TIER-4 (2026-05-23): SYSTEMATIC TERMINAL-MODAL CAPTURE PASS.
+      //   After the flop walk completes, BEFORE the flop zip emits, replay
+      //   to each terminal, open the turn modal, capture the cells, close.
+      //   This makes terminal_card_maps fully populated by the time the
+      //   workload JSONs emit later. Skipped on resume (skipFlopWalk) because
+      //   in that path the worker already has card_maps from the workload.
+      if (!skipFlopWalk && !dryRun && Array.isArray(window.__msCachedFlopTerminals) && window.__msCachedFlopTerminals.length) {
+        log('phase', { name: 'capture_terminal_modals' });
+        window.__msProgress.phase = 'capturing_terminal_modals';
+        result.terminal_card_maps = result.terminal_card_maps || {};
+        for (const ft of window.__msCachedFlopTerminals) {
+          try {
+            if (W.modalKind && W.modalKind()) { try { await W.closeModalX(); } catch (_) {} }
+            const okReplay = await replayFromFlopRoot(ft.parent, result);
+            if (!okReplay) {
+              result.warnings.push(`pre-zip modal capture: replay to ${ft.terminal_node} failed`);
+              continue;
+            }
+            const okOpen = await openModalByCloser(ft.via);
+            if (!okOpen) {
+              result.warnings.push(`pre-zip modal capture: open modal at ${ft.terminal_node} failed`);
+              continue;
+            }
+            const cells = W.readModalCells('turn');
+            const available = cells.filter(c => c.status === 'ok').map(c => c.card);
+            const used      = cells.filter(c => c.status === 'used').map(c => c.card);
+            const dim_dom   = cells.filter(c => c.status === 'dim').map(c => c.card);
+            result.terminal_card_maps[ft.terminal_node] = {
+              recorded_at: new Date().toISOString(),
+              recorded_by_device: cfg.device_name || null,
+              recorded_by_session: cfg.session_id || null,
+              total_cells: cells.length,
+              available, used, dim_dom,
+              aliases: [],
+              terminal: ft.terminal_node,
+              source: 'pre_zip_capture',
+            };
+            log('terminal_modal_captured', { terminal: ft.terminal_node, n_available: available.length, n_used: used.length, n_dim: dim_dom.length });
+            try { await W.closeModalX(); } catch (_) {}
+            await sleep(300);
+          } catch (e) {
+            result.warnings.push(`pre-zip modal capture at ${ft.terminal_node}: ${e.message}`);
+            try { await W.closeModalX(); } catch (_) {}
+          }
+        }
+        try { await ensureFlopRoot(); } catch (_) {}
+      }
+
       if (!dryRun && !skipFlopWalk) {
         window.__msProgress.phase = 'scraping_flop';
         const flopZipName = `${result.tree}_${result.flop}_flop.zip`;
@@ -570,6 +619,115 @@
             } catch (e) {
               result.warnings.push(`emit_resume_file (after_flop_zip) failed: ${e.message}`);
             }
+          }
+
+          // POST-TIER-4 (2026-05-23): EMIT N RANDOMIZED WORKLOAD JSONS.
+          //   For each workload file i in [1..N], for each terminal, pick a
+          //   random 5-40% slice of (available - used - dim_dom). Each file
+          //   is a self-contained worker-mode payload: terminal info +
+          //   card_maps + assigned_cards subset. Worker imports the JSON
+          //   and runs __scrapeMultiStreet with skip_flop_walk + cached_flop_terminals
+          //   + target_cards_per_terminal derived from assigned_cards.
+          const wantsWorkloads = (cfg.skip_workload_emission !== true) && (cfg.scope === 'flop+turn');
+          if (wantsWorkloads) {
+            const N = Math.max(1, Math.min(20, cfg.workload_partitions || 4));
+            const sessionId = cfg.session_id || ('ses-' + Math.random().toString(36).slice(2, 10));
+            const terms = (window.__msCachedFlopTerminals || []).slice();
+            const tcm = result.terminal_card_maps || {};
+            function rint(lo, hi) { return lo + Math.floor(Math.random() * (hi - lo + 1)); }
+            function shuffle(arr) {
+              const a = arr.slice();
+              for (let i = a.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [a[i], a[j]] = [a[j], a[i]];
+              }
+              return a;
+            }
+            const workloads = [];
+            for (let i = 1; i <= N; i++) {
+              const wl = {
+                schema_version: '1',
+                workload_id: 'wl-' + Math.random().toString(36).slice(2, 10) + '-' + Date.now().toString(36) + '-p' + i,
+                tree: result.tree,
+                flop: result.flop,
+                chipsPerBb: chipsPerBb,
+                partition_index: i,
+                partition_count: N,
+                created_at: new Date().toISOString(),
+                created_by_device: cfg.device_name || null,
+                created_by_session: sessionId,
+                flop_terminals: terms.map(t => ({ parent: t.parent, terminal_node: t.terminal_node, via: t.via, code: t.code })),
+                terminals: [],
+              };
+              for (const t of terms) {
+                const m = tcm[t.terminal_node] || {};
+                const avail = (m.available || []).slice();
+                const used  = (m.used || []).slice();
+                const dim   = (m.dim_dom || []).slice();
+                const used_set = new Set(used);
+                const dim_set = new Set(dim);
+                const walkable = avail.filter(c => !used_set.has(c) && !dim_set.has(c));
+                const pctMin = 0.05, pctMax = 0.40;
+                const targetPct = pctMin + Math.random() * (pctMax - pctMin);
+                const targetN = Math.max(1, Math.round(walkable.length * targetPct));
+                const assigned = shuffle(walkable).slice(0, Math.min(targetN, walkable.length));
+                wl.terminals.push({
+                  terminal_node: t.terminal_node,
+                  parent: t.parent,
+                  via: t.via,
+                  code: t.code,
+                  card_map: {
+                    total_cells: m.total_cells || (avail.length + used.length + dim.length),
+                    available: avail,
+                    used: used,
+                    dim_dom: dim,
+                  },
+                  assigned_cards: assigned,
+                  assigned_count: assigned.length,
+                  assigned_percentage: walkable.length ? +(100 * assigned.length / walkable.length).toFixed(2) : 0,
+                  walkable_total: walkable.length,
+                });
+              }
+              workloads.push(wl);
+            }
+            // Trigger Chrome downloads (each as its own JSON file)
+            for (const wl of workloads) {
+              try {
+                const name = `${wl.tree}_${wl.flop}_workload_${String(wl.partition_index).padStart(2,'0')}_of_${String(wl.partition_count).padStart(2,'0')}_${wl.workload_id}.json`;
+                const blob = new Blob([JSON.stringify(wl, null, 2)], { type: 'application/json' });
+                const u = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = u; a.download = name;
+                document.body.appendChild(a); a.click();
+                setTimeout(() => { a.remove(); URL.revokeObjectURL(u); }, 1500);
+                await sleep(400 + downloadDelayMs);
+                log('workload_emitted', { name, partition: wl.partition_index, of: wl.partition_count });
+              } catch (e) {
+                result.warnings.push(`workload emit ${wl.workload_id}: ${e.message}`);
+              }
+            }
+            result.workloads_emitted = workloads.map(w => ({
+              workload_id: w.workload_id,
+              partition_index: w.partition_index,
+              partition_count: w.partition_count,
+              terminals: w.terminals.map(t => ({ terminal_node: t.terminal_node, assigned_count: t.assigned_count, walkable_total: t.walkable_total })),
+            }));
+            log('all_workloads_emitted', { count: workloads.length });
+            saveCheckpoint(buildCheckpoint({ last_event: 'workloads_emitted', n_workloads: workloads.length }));
+          }
+
+          // POST-TIER-4 (2026-05-23): STOP GATE — producer device emits
+          //   flop+workloads and stops. Workers re-launch with cfg.skip_flop_walk
+          //   + cfg.cached_flop_terminals + cfg.target_cards_per_terminal to do
+          //   the turn-walk portion. If neither target_cards_per_terminal nor
+          //   turn_cards_per_terminal is supplied, this is a producer run -- exit.
+          if (!cfg.target_cards_per_terminal && !cfg.turn_cards_per_terminal && !cfg.flop_terminal_filter) {
+            log('producer_run_complete', { workloads_emitted: (result.workloads_emitted || []).length });
+            window.__msProgress.phase = 'producer_complete';
+            result.finished_at = new Date().toISOString();
+            result.elapsed_s = Math.round((Date.now() - window.__msProgress.t_start) / 1000);
+            window.__msResult = result;
+            return result;
           }
           if (!autoContinue) await pauseUntilContinue(`flop zip emitted (${flopZipName})`);
         }
@@ -1254,6 +1412,10 @@
   window.__msPhase7EmergencyHookInstalled = true;
   window.__msTier1FixesInstalled = true;
   window.__msTier23OrchInstalled = true;
+  window.__msPostTier4Installed = true;        // 2026-05-23 v4
+  window.__msTerminalModalCaptureInstalled = true;
+  window.__msWorkloadEmissionInstalled = true;
+  window.__msReplayPacingV4Installed = true;
   window.__msCachedTerminalsEarlySetInstalled = true; // POST-TIER-1 HOTFIX 2026-05-22
   window.__msCategoriesPanelBroadLabelsInstalled = true; // POST-TIER-3 HOTFIX 2026-05-22 (declared here for probe convenience)
 

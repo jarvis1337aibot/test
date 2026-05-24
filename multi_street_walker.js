@@ -112,7 +112,7 @@
   const $$    = sel => [...document.querySelectorAll(sel)];
 
   function _nodeWaitMs() {
-    const minDef = 3000, maxDef = 5000;
+    const minDef = 2000, maxDef = 4000;
     const wMin = (typeof window.__msNodeWaitMin === 'number') ? window.__msNodeWaitMin : minDef;
     const wMax = (typeof window.__msNodeWaitMax === 'number') ? window.__msNodeWaitMax : maxDef;
     if (wMin <= 0 && wMax <= 0) return 0;
@@ -922,6 +922,7 @@
       if (!actEl) throw new Error(`no enabled "${label}" at ${pathSoFar}`);
       const expected = pathSoFar ? `${pathSoFar}-${seg}` : seg;
       let r = await clickActionAndWait(actEl, expected);
+      if (r.success) { await sleep(2000 + Math.floor(Math.random() * 2000)); }
       if (!r.success) {
         await sleep(400);
         const ab2 = activeBlock();
@@ -964,6 +965,7 @@
       await closeModalX();
       throw new Error(`pickCardCommit: ${card} triggered no-sim popup post-click`);
     }
+    await sleep(2000 + Math.floor(Math.random() * 2000));
     const sm = urlSuitMap();
     const actualForKind = kind === 'turn' ? urlTurn() : urlRiver();
     const isAlias = !!(sm && actualForKind && actualForKind !== card);
