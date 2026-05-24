@@ -953,12 +953,13 @@
           //   Lets human_like.partial_browse_chance control how often a
           //   between-card "looked at other cards" burst fires. Pure noise:
           //   no clicks on cards, no extra /range/url calls.
-          // POST-TIER-8 (2026-05-24): real partial walk between cards on the
-          //   same terminal. Fires only if there are MORE assigned cards
-          //   left to walk on this terminal (no point doing noise before
-          //   switching terminals). Passes the still-to-walk list as
-          //   excludeCards so the partial walk picks a card we won't
-          //   later try to walk for real (avoids 'used'-status conflict).
+          // POST-TIER-8 (2026-05-24) + v9 FIX (2026-05-24): real partial walk
+          //   between cards on the same terminal. Fires only if more
+          //   assigned cards remain. CRITICAL: ensureTurnModalAtTerminal()
+          //   MUST be called first because after pickCardCommit+dfsStreet
+          //   the trainer is at ?turn=X with the modal CLOSED. The partial
+          //   walk needs the modal OPEN to pick a random cell. Without the
+          //   reopen, partialWalkOnTerminal returns 0 silently.
           try {
             const _stillToWalk = (explicitCards || []).filter(
               c => !(completedCardsPerTerminal[ft.terminal_node] || []).includes(c)
@@ -966,10 +967,16 @@
             const pbChance = (humanCfg && typeof humanCfg.partial_browse_chance === 'number')
               ? humanCfg.partial_browse_chance : 0;
             if (_stillToWalk.length > 0 && pbChance > 0 && Math.random() < pbChance) {
-              const fn = (typeof W.partialWalkOnTerminal === 'function')
-                ? W.partialWalkOnTerminal : W.pretendPartialBrowse;
-              if (typeof fn === 'function') {
-                await fn(ft.terminal_node, { excludeCards: _stillToWalk });
+              // Reopen the turn modal at the terminal first (cheap path).
+              const _er = await ensureTurnModalAtTerminal();
+              if (_er.ok) {
+                const fn = (typeof W.partialWalkOnTerminal === 'function')
+                  ? W.partialWalkOnTerminal : W.pretendPartialBrowse;
+                if (typeof fn === 'function') {
+                  await fn(ft.terminal_node, { excludeCards: _stillToWalk });
+                }
+              } else {
+                result.warnings.push(`partial walk skipped at ${ft.terminal_node}: ensureTurnModalAtTerminal failed (${_er.path})`);
               }
             }
           } catch (_) {}

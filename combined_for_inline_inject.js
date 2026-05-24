@@ -1,24 +1,17 @@
 /* combined_for_inline_inject.js -- hand-scraper-postflop-flop-turn
  *
- * v9 (2026-05-24): walker fixes layer on top of v8 producer/worker model
+ * v9.1 (2026-05-24): hot-fix the partial-walk modal precondition.
+ *   Orchestrator now calls ensureTurnModalAtTerminal() BEFORE firing
+ *   partialWalkOnTerminal, since after pickCardCommit+dfsStreet the
+ *   trainer is at ?turn=X with the modal closed. Without this reopen
+ *   the partial walk returned 0 silently.
  *
- *   Walker fixes:
- *     - activateCategoriesTab(): ALWAYS click the tab; don't trust the
- *       "already activated" cache or the panel-locator pre-check. Wait
- *       up to 3s for the panel to render.
- *     - partialWalkOnTerminal(): REAL partial walk between cards on the
- *       same terminal. Picks a random ok-status cell NOT in the still-
- *       to-walk assigned list, commits it, walks 1-3 real action blocks
- *       forward (with category clicks between), waits 10-20s.
- *       Quota: 2-4 /range/url calls per partial walk. Fires only when
- *       more assigned cards remain on the terminal.
- *
- *   v8 carried forward: producer/worker model, inline modal capture in
- *   flop DFS, 100% coverage workload partitions, 5-40% per workload,
- *   slim schema, url field, v4 timings (2-4s).
+ * v9 carried forward: always-click Categories tab, real partial walk
+ * (1 card commit + 1-3 real action clicks + category clicks + 10-20s
+ * wait), excludeCards protection, v8 producer/worker model, v4 timings.
  */
 
-/* ==================== 1) WALKER (v9 fixes) ==================== */
+/* ==================== 1) WALKER ==================== */
 /* multi_street_walker.js - DOM-only walker for the PLO Master Mind postflop trainer.
  *
  * Installs window.__W with primitives for DFS, modal handling, alias-aware card
@@ -1868,7 +1861,7 @@
   return 'multi-street helpers installed (window.__msHelpers) [v15 banner-only republish; v14 labelToTypeSize static-map fix; v13 plomm envelope support; v11 dynamic bet sizings]';
 })();
 
-/* ==================== 3) ORCHESTRATOR (v9 real partial walk wiring) ==================== */
+/* ==================== 3) ORCHESTRATOR (v9.1 partial-walk modal reopen) ==================== */
 /* scrape_multistreet.js - flop+turn tree scraper for the PLO Master Mind
  * postflop trainer. Walks (flop -> every canonical turn under every flop
  * terminal), captures /range/url envelopes, decodes binary/plomm blobs,
@@ -2824,12 +2817,13 @@
           //   Lets human_like.partial_browse_chance control how often a
           //   between-card "looked at other cards" burst fires. Pure noise:
           //   no clicks on cards, no extra /range/url calls.
-          // POST-TIER-8 (2026-05-24): real partial walk between cards on the
-          //   same terminal. Fires only if there are MORE assigned cards
-          //   left to walk on this terminal (no point doing noise before
-          //   switching terminals). Passes the still-to-walk list as
-          //   excludeCards so the partial walk picks a card we won't
-          //   later try to walk for real (avoids 'used'-status conflict).
+          // POST-TIER-8 (2026-05-24) + v9 FIX (2026-05-24): real partial walk
+          //   between cards on the same terminal. Fires only if more
+          //   assigned cards remain. CRITICAL: ensureTurnModalAtTerminal()
+          //   MUST be called first because after pickCardCommit+dfsStreet
+          //   the trainer is at ?turn=X with the modal CLOSED. The partial
+          //   walk needs the modal OPEN to pick a random cell. Without the
+          //   reopen, partialWalkOnTerminal returns 0 silently.
           try {
             const _stillToWalk = (explicitCards || []).filter(
               c => !(completedCardsPerTerminal[ft.terminal_node] || []).includes(c)
@@ -2837,10 +2831,16 @@
             const pbChance = (humanCfg && typeof humanCfg.partial_browse_chance === 'number')
               ? humanCfg.partial_browse_chance : 0;
             if (_stillToWalk.length > 0 && pbChance > 0 && Math.random() < pbChance) {
-              const fn = (typeof W.partialWalkOnTerminal === 'function')
-                ? W.partialWalkOnTerminal : W.pretendPartialBrowse;
-              if (typeof fn === 'function') {
-                await fn(ft.terminal_node, { excludeCards: _stillToWalk });
+              // Reopen the turn modal at the terminal first (cheap path).
+              const _er = await ensureTurnModalAtTerminal();
+              if (_er.ok) {
+                const fn = (typeof W.partialWalkOnTerminal === 'function')
+                  ? W.partialWalkOnTerminal : W.pretendPartialBrowse;
+                if (typeof fn === 'function') {
+                  await fn(ft.terminal_node, { excludeCards: _stillToWalk });
+                }
+              } else {
+                result.warnings.push(`partial walk skipped at ${ft.terminal_node}: ensureTurnModalAtTerminal failed (${_er.path})`);
               }
             }
           } catch (_) {}
