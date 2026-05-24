@@ -646,13 +646,54 @@
               for (const c of counts) { parts.push(sh.slice(off, off + c)); off += c; }
               return parts;
             }
+            // v9.8 (2026-05-24): monotone-board auto-alias rule. On monotone S
+            //   or H boards, D and C non-board cards are aliases of their
+            //   canonical counterpart (H on monotone S, S on monotone H). The
+            //   trainer collapses them at click time (URL gets ?suitMap=...).
+            //   We exclude them from assigned_cards at emit time so no
+            //   quota is burned walking aliases, and record the skip in
+            //   auto_aliased_cards per terminal for audit.
+            //   Monotone D and C boards: no auto-rule (would require board
+            //   suit to alias itself); runtime detection still catches them.
+            function detectMonotoneBoardSuit(fl) {
+              if (!fl || fl.length !== 6) return null;
+              const s = fl[1] + fl[3] + fl[5];
+              return (s[0] === s[1] && s[1] === s[2]) ? s[0] : null;
+            }
+            const monoBoardSuit = detectMonotoneBoardSuit(result.flop);
+            const applyMonoRule = (monoBoardSuit === 's' || monoBoardSuit === 'h');
+            const monoCanonicalSuit = monoBoardSuit === 's' ? 'h'
+                                    : monoBoardSuit === 'h' ? 's'
+                                    : null;
+            function splitMonoAliases(cards) {
+              if (!applyMonoRule) return { kept: cards.slice(), aliased: [] };
+              const kept = [], aliased = [];
+              for (const c of cards) {
+                const suit = (c && c.length === 2) ? c[1].toLowerCase() : null;
+                if (suit === 'd' || suit === 'c') aliased.push(c);
+                else kept.push(c);
+              }
+              return { kept, aliased };
+            }
+            if (applyMonoRule) {
+              log('monotone_rule_applied', {
+                flop: result.flop,
+                board_suit: monoBoardSuit,
+                canonical_suit: monoCanonicalSuit,
+              });
+            }
             const partitionsByTerm = {};
+            const autoAliasedByTerm = {};
             for (const t of terms) {
               const m = tcm[t.terminal_node] || {};
               const avail = (m.available || []).slice();
               const used  = new Set(m.used || []);
               const dim   = new Set(m.dim_dom || []);
-              const walkable = avail.filter(c => !used.has(c) && !dim.has(c));
+              let walkable = avail.filter(c => !used.has(c) && !dim.has(c));
+              // v9.8: split off mono-alias cards (D/C on monotone S/H boards)
+              const split = splitMonoAliases(walkable);
+              walkable = split.kept;
+              autoAliasedByTerm[t.terminal_node] = split.aliased;
               partitionsByTerm[t.terminal_node] = distributeCards(walkable, N);
             }
             // Build N workload payloads
@@ -667,22 +708,40 @@
                 chipsPerBb: chipsPerBb,
                 partition_index: i,
                 partition_count: N,
+                monotone_rule_applied: applyMonoRule ? {
+                  board_suit: monoBoardSuit,
+                  canonical_suit: monoCanonicalSuit,
+                  rule: 'D and C non-board cards are aliases of their ' +
+                        monoCanonicalSuit.toUpperCase() + ' counterparts',
+                } : null,
                 flop_terminals: terms.map(t => ({
                   parent: t.parent, terminal_node: t.terminal_node, via: t.via, code: t.code,
                 })),
                 terminals: terms.map(t => {
                   const m = tcm[t.terminal_node] || {};
+                  // v9.8: card_map.available shows only the walkable
+                  //   non-alias cards. The aliased D/C cards live in
+                  //   card_map.auto_aliased alongside used/dim_dom for
+                  //   audit. assigned_cards is also alias-free.
+                  const availSplit = splitMonoAliases(m.available || []);
                   return {
                     terminal_node: t.terminal_node,
                     parent: t.parent,
                     via: t.via,
                     code: t.code,
                     card_map: {
-                      available: (m.available || []).slice(),
+                      available: availSplit.kept,
                       used: (m.used || []).slice(),
                       dim_dom: (m.dim_dom || []).slice(),
+                      auto_aliased: availSplit.aliased,
+                      auto_alias_rule: applyMonoRule
+                        ? ('monotone ' + monoBoardSuit.toUpperCase() +
+                           ' board: D and C non-board cards are aliases of their ' +
+                           monoCanonicalSuit.toUpperCase() + ' counterparts')
+                        : null,
                     },
                     assigned_cards: (partitionsByTerm[t.terminal_node] || [])[i - 1] || [],
+                    auto_aliased_cards: (autoAliasedByTerm[t.terminal_node] || []).slice(),
                   };
                 }),
               };
@@ -1634,6 +1693,6 @@
     };
   }
 
-  return 'multi-street scraper installed (window.__scrapeMultiStreet, window.__scrapeSession) [v9.7.1 session-record-only emit, __msEmitResumeFile removed; v9.7 session-record-emit; tier 2/3 orch: categories-activate + partial-browse + shuffle_cards; tier-1 fixes: all-terminals-cached + per-card-manifest + modal-cleanup; phase 7 emergency-stop hook; phase 4 human-like noise wired (cfg.human_like -> window.__msHumanCfg + turn hover hook); phase 3 session wrapper; phase 2 card maps + target_cards_per_terminal; phase 1 session mode (zip_per_card + device_name + session_id); post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
+  return 'multi-street scraper installed (window.__scrapeMultiStreet, window.__scrapeSession) [v9.8 monotone-rule auto-alias (D/C aliased on monotone S/H boards); v9.7.1 session-record-only emit, __msEmitResumeFile removed; v9.7 session-record-emit; tier 2/3 orch: categories-activate + partial-browse + shuffle_cards; tier-1 fixes: all-terminals-cached + per-card-manifest + modal-cleanup; phase 7 emergency-stop hook; phase 4 human-like noise wired (cfg.human_like -> window.__msHumanCfg + turn hover hook); phase 3 session wrapper; phase 2 card maps + target_cards_per_terminal; phase 1 session mode (zip_per_card + device_name + session_id); post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
 })();
 
