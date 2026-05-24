@@ -1294,15 +1294,24 @@
           }
 
           // PHASE 2: target-cards-aware cell pick.
-          //   With targetCardsPerTerminal[terminal] provided: iterate the
-          //   given list in order, pick the first card that maps to an
-          //   available cell. Aliased/dim cards are recorded as alias-hits
-          //   and skipped (consistent with legacy behavior).
-          //   Without: fall back to legacy top-to-bottom DOM order.
+          //   With targetCardsPerTerminal[terminal] OR explicitCards
+          //   (cfg.turn_cards_per_terminal[terminal]) provided: iterate
+          //   the given list in order, pick the first card that maps to
+          //   an available cell. Aliased/dim cards are recorded as
+          //   alias-hits and skipped (consistent with legacy behavior).
+          //   Without either: fall back to legacy top-to-bottom DOM order.
+          //
+          //   POST-TIER-9 FIX v9.5 (2026-05-24): coalesce cfg.target_cards_per_terminal
+          //   (targetCardsPerTerminal) and cfg.turn_cards_per_terminal
+          //   (explicitCards). Either is sufficient to drive the picker.
+          //   Bug fixed: without this, when only cfg.turn_cards_per_terminal
+          //   was set, iterCards fell back to ALL modal cells, picker picked
+          //   random non-target cards, and the new pre-target partial walks
+          //   fired for each one -- burning quota with no real walks.
           let target = null;
           const targetList = (targetCardsPerTerminal && Array.isArray(targetCardsPerTerminal[ft.terminal_node]))
             ? targetCardsPerTerminal[ft.terminal_node]
-            : null;
+            : (Array.isArray(explicitCards) ? explicitCards : null);
           const cellByCard = new Map(cells.map(c => [c.card, c]));
           let iterCards = targetList ? targetList : cells.map(c => c.card);
           // TIER 3 FIX #6: random visit order when no explicit targetList and
