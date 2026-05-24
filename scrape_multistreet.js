@@ -613,7 +613,10 @@
           saveCheckpoint(buildCheckpoint({ last_event: 'flop_zip_emitted', last_zip: flopZipName }));
           // v17: emit resume.json alongside the flop zip (now reads the
           //   just-saved checkpoint).
-          if (emitResumeFile && typeof window.__msEmitResumeFile === 'function') {
+          // POST-TIER-5 (2026-05-23): skip resume_after_flop_zip.json when in
+          //   producer mode -- the workload JSONs carry the resume info.
+          const _producerMode = (cfg.skip_workload_emission !== true) && (cfg.scope === 'flop+turn');
+          if (!_producerMode && emitResumeFile && typeof window.__msEmitResumeFile === 'function') {
             try {
               await window.__msEmitResumeFile('after_flop_zip', downloadDelayMs);
             } catch (e) {
@@ -621,20 +624,17 @@
             }
           }
 
-          // POST-TIER-4 (2026-05-23): EMIT N RANDOMIZED WORKLOAD JSONS.
-          //   For each workload file i in [1..N], for each terminal, pick a
-          //   random 5-40% slice of (available - used - dim_dom). Each file
-          //   is a self-contained worker-mode payload: terminal info +
-          //   card_maps + assigned_cards subset. Worker imports the JSON
-          //   and runs __scrapeMultiStreet with skip_flop_walk + cached_flop_terminals
-          //   + target_cards_per_terminal derived from assigned_cards.
+          // POST-TIER-5 (2026-05-23): EMIT N WORKLOAD JSONS WITH 100% COVERAGE.
+          //   For each terminal, shuffle the walkable cards and distribute
+          //   round-robin across N workloads so every card lands in exactly
+          //   one workload (no gaps, no overlap). With N=4 each workload
+          //   gets ~25% of cards (inside the 5-40% target window).
+          //   Schema is SLIM: only fields needed for resume/identification.
           const wantsWorkloads = (cfg.skip_workload_emission !== true) && (cfg.scope === 'flop+turn');
           if (wantsWorkloads) {
             const N = Math.max(1, Math.min(20, cfg.workload_partitions || 4));
-            const sessionId = cfg.session_id || ('ses-' + Math.random().toString(36).slice(2, 10));
             const terms = (window.__msCachedFlopTerminals || []).slice();
             const tcm = result.terminal_card_maps || {};
-            function rint(lo, hi) { return lo + Math.floor(Math.random() * (hi - lo + 1)); }
             function shuffle(arr) {
               const a = arr.slice();
               for (let i = a.length - 1; i > 0; i--) {
@@ -643,57 +643,106 @@
               }
               return a;
             }
+            // Producer's trainer URL (workers navigate here before bootstrapping the workload)
+            const producerUrl = location.origin + location.pathname + '?type=postflop&tree=' + encodeURIComponent(result.tree) + '&flop=' + encodeURIComponent(result.flop);
+            // POST-TIER-6 (2026-05-23): CONSTRAINED RANDOM PARTITION.
+            //   For each terminal, generate N random percentages each in
+            //   [5%, 40%] summing to 100%, convert to integer card counts
+            //   that sum to walkable.length exactly, shuffle walkable, then
+            //   split into chunks of those sizes. Guarantees:
+            //     - 100% coverage (every card in exactly 1 workload)
+            //     - each workload's share for THAT terminal is in [5%, 40%]
+            //   Edge case: walkable.length < N -> round-robin (some
+            //   workloads end up empty for that terminal, unavoidable).
+            const MIN_PCT = 0.05, MAX_PCT = 0.40;
+            function genPercentagesInRange(n, minP, maxP, maxAttempts = 2000) {
+              // Generate n random values, normalize, check bounds, reject + retry.
+              for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                const raw = Array.from({length: n}, () => Math.random());
+                const sumRaw = raw.reduce((a, b) => a + b, 0);
+                const norm = raw.map(r => r / sumRaw);
+                if (norm.every(p => p >= minP && p <= maxP)) return norm;
+              }
+              // Fallback: equal split (unlikely to be needed for n=4, [5,40])
+              return Array.from({length: n}, () => 1 / n);
+            }
+            function distributeCards(walkable, n) {
+              if (walkable.length === 0) return Array.from({length: n}, () => []);
+              if (walkable.length < n) {
+                // Not enough cards for everyone -- round-robin assigns to first M workloads.
+                const parts = Array.from({length: n}, () => []);
+                const sh = shuffle(walkable);
+                for (let i = 0; i < sh.length; i++) parts[i].push(sh[i]);
+                return parts;
+              }
+              const pcts = genPercentagesInRange(n, MIN_PCT, MAX_PCT);
+              // Convert to integer counts, each at least 1
+              let counts = pcts.map(p => Math.max(1, Math.round(p * walkable.length)));
+              let sum = counts.reduce((a, b) => a + b, 0);
+              // Adjust to sum exactly walkable.length
+              while (sum > walkable.length) {
+                // Decrement the largest (but never below 1)
+                let maxIdx = 0;
+                for (let i = 1; i < counts.length; i++) if (counts[i] > counts[maxIdx]) maxIdx = i;
+                if (counts[maxIdx] > 1) { counts[maxIdx]--; sum--; } else break;
+              }
+              while (sum < walkable.length) {
+                // Increment the smallest
+                let minIdx = 0;
+                for (let i = 1; i < counts.length; i++) if (counts[i] < counts[minIdx]) minIdx = i;
+                counts[minIdx]++; sum++;
+              }
+              const sh = shuffle(walkable);
+              const parts = []; let off = 0;
+              for (const c of counts) { parts.push(sh.slice(off, off + c)); off += c; }
+              return parts;
+            }
+            const partitionsByTerm = {};
+            for (const t of terms) {
+              const m = tcm[t.terminal_node] || {};
+              const avail = (m.available || []).slice();
+              const used  = new Set(m.used || []);
+              const dim   = new Set(m.dim_dom || []);
+              const walkable = avail.filter(c => !used.has(c) && !dim.has(c));
+              partitionsByTerm[t.terminal_node] = distributeCards(walkable, N);
+            }
+            // Build N workload payloads
             const workloads = [];
             for (let i = 1; i <= N; i++) {
               const wl = {
-                schema_version: '1',
-                workload_id: 'wl-' + Math.random().toString(36).slice(2, 10) + '-' + Date.now().toString(36) + '-p' + i,
+                schema_version: '2',
+                workload_id: 'wl-' + Math.random().toString(36).slice(2, 10) + '-p' + i,
+                url: producerUrl,
                 tree: result.tree,
                 flop: result.flop,
                 chipsPerBb: chipsPerBb,
                 partition_index: i,
                 partition_count: N,
-                created_at: new Date().toISOString(),
-                created_by_device: cfg.device_name || null,
-                created_by_session: sessionId,
-                flop_terminals: terms.map(t => ({ parent: t.parent, terminal_node: t.terminal_node, via: t.via, code: t.code })),
-                terminals: [],
+                flop_terminals: terms.map(t => ({
+                  parent: t.parent, terminal_node: t.terminal_node, via: t.via, code: t.code,
+                })),
+                terminals: terms.map(t => {
+                  const m = tcm[t.terminal_node] || {};
+                  return {
+                    terminal_node: t.terminal_node,
+                    parent: t.parent,
+                    via: t.via,
+                    code: t.code,
+                    card_map: {
+                      available: (m.available || []).slice(),
+                      used: (m.used || []).slice(),
+                      dim_dom: (m.dim_dom || []).slice(),
+                    },
+                    assigned_cards: (partitionsByTerm[t.terminal_node] || [])[i - 1] || [],
+                  };
+                }),
               };
-              for (const t of terms) {
-                const m = tcm[t.terminal_node] || {};
-                const avail = (m.available || []).slice();
-                const used  = (m.used || []).slice();
-                const dim   = (m.dim_dom || []).slice();
-                const used_set = new Set(used);
-                const dim_set = new Set(dim);
-                const walkable = avail.filter(c => !used_set.has(c) && !dim_set.has(c));
-                const pctMin = 0.05, pctMax = 0.40;
-                const targetPct = pctMin + Math.random() * (pctMax - pctMin);
-                const targetN = Math.max(1, Math.round(walkable.length * targetPct));
-                const assigned = shuffle(walkable).slice(0, Math.min(targetN, walkable.length));
-                wl.terminals.push({
-                  terminal_node: t.terminal_node,
-                  parent: t.parent,
-                  via: t.via,
-                  code: t.code,
-                  card_map: {
-                    total_cells: m.total_cells || (avail.length + used.length + dim.length),
-                    available: avail,
-                    used: used,
-                    dim_dom: dim,
-                  },
-                  assigned_cards: assigned,
-                  assigned_count: assigned.length,
-                  assigned_percentage: walkable.length ? +(100 * assigned.length / walkable.length).toFixed(2) : 0,
-                  walkable_total: walkable.length,
-                });
-              }
               workloads.push(wl);
             }
-            // Trigger Chrome downloads (each as its own JSON file)
+            // Trigger downloads
             for (const wl of workloads) {
               try {
-                const name = `${wl.tree}_${wl.flop}_workload_${String(wl.partition_index).padStart(2,'0')}_of_${String(wl.partition_count).padStart(2,'0')}_${wl.workload_id}.json`;
+                const name = `${wl.tree}_${wl.flop}_workload_${String(wl.partition_index).padStart(2,'0')}_of_${String(wl.partition_count).padStart(2,'0')}.json`;
                 const blob = new Blob([JSON.stringify(wl, null, 2)], { type: 'application/json' });
                 const u = URL.createObjectURL(blob);
                 const a = document.createElement('a');
@@ -710,7 +759,10 @@
               workload_id: w.workload_id,
               partition_index: w.partition_index,
               partition_count: w.partition_count,
-              terminals: w.terminals.map(t => ({ terminal_node: t.terminal_node, assigned_count: t.assigned_count, walkable_total: t.walkable_total })),
+              terminals: w.terminals.map(t => ({
+                terminal_node: t.terminal_node,
+                assigned_count: t.assigned_cards.length,
+              })),
             }));
             log('all_workloads_emitted', { count: workloads.length });
             saveCheckpoint(buildCheckpoint({ last_event: 'workloads_emitted', n_workloads: workloads.length }));
@@ -1412,6 +1464,8 @@
   window.__msPhase7EmergencyHookInstalled = true;
   window.__msTier1FixesInstalled = true;
   window.__msTier23OrchInstalled = true;
+  window.__msPostTier5Installed = true;
+  window.__msPostTier6Installed = true; // 2026-05-23 v6: constrained random partition          // 2026-05-23 v5: round-robin coverage + slim schema + URL
   window.__msPostTier4Installed = true;        // 2026-05-23 v4
   window.__msTerminalModalCaptureInstalled = true;
   window.__msWorkloadEmissionInstalled = true;
