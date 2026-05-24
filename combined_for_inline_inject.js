@@ -1,16 +1,14 @@
 /* combined_for_inline_inject.js -- hand-scraper-postflop-flop-turn
  *
- * v9.3 (2026-05-24): partial walk fires BEFORE every target card walk
- *   - Walker: partialWalkOnTerminal now walks 1-2 actions (was 1-3),
- *     stops early if remaining non-fold-non-allin candidates are only
- *     street closers (end-of-line), always finishes with category click +
- *     10-20s settle.
- *   - Orchestrator: removed post-card partial-walk. Added PRE-target
- *     partial walk in cell loop -- fires before every target including
- *     the first on a new terminal. excludeCards = entire explicitCards
- *     list so partial walk never picks a target card.
- *   - Cell loop early-exit + cheap-reopen retries + post-partial-walk
- *     cleanup (v9.2) carried forward.
+ * v9.4 (2026-05-24): cheap-reopen reliability after partial walk
+ *   - stabilizeBackToTerminal: per-click wait 700ms -> 2000ms, retry
+ *     ONCE after a failed click (re-read blocks + click again).
+ *   - Orchestrator post-partial-walk cleanup: switches from
+ *     stabilize+reopenChipModal to ensureTurnModalAtTerminal. Modal is
+ *     GUARANTEED open after cleanup (cheap first, replay fallback).
+ *
+ * v9.3 carried forward: partial walk fires BEFORE every target,
+ * 1-2 actions, end-of-line stop, excludeCards = entire target list.
  */
 
 /* ==================== 1) WALKER ==================== */
@@ -2062,6 +2060,9 @@
   }
 
   async function stabilizeBackToTerminal(ftTerminalNode) {
+    // POST-TIER-9 FIX v9.4 (2026-05-24): per-click wait 700ms -> 2000ms,
+    //   and if the URL doesn't change after a click, retry ONCE before
+    //   bailing. Tolerates slow VPN + React render lag during navigation.
     if (W.modalKind()) await W.closeModalX();
     if (W.urlNode() === ftTerminalNode) return true;
     let safety = 0;
@@ -2072,8 +2073,19 @@
       if (!target) return false;
       const before = W.urlNode();
       target.headerEl.click();
-      await sleep(700);
-      if (W.urlNode() === before) return false;
+      await sleep(2000);
+      // If URL didn't change, give it ONE more chance (re-read blocks +
+      //   click again — the headerEl might be stale after a partial re-render).
+      if (W.urlNode() === before) {
+        const blocks2 = W.readBlocks();
+        let target2 = null;
+        for (const b of blocks2) { if (b.actions.some(a => a.chosen)) target2 = b; }
+        if (target2 && target2.headerEl) {
+          target2.headerEl.click();
+          await sleep(2000);
+        }
+        if (W.urlNode() === before) return false; // truly stuck
+      }
       if (W.urlNode() === ftTerminalNode) {
         if (W.modalKind()) await W.closeModalX();
         return true;
@@ -3227,11 +3239,17 @@
               ? humanCfg.partial_browse_chance : 0;
             if (pbChance > 0 && Math.random() < pbChance && typeof W.partialWalkOnTerminal === 'function') {
               await W.partialWalkOnTerminal(ft.terminal_node, { excludeCards: explicitCards || [] });
-              // Cleanup: restore terminal + open modal so the upcoming
-              //   target commit proceeds without a forced full replay.
+              // POST-TIER-9 v9.4 (2026-05-24): cleanup uses ensureTurnModalAtTerminal
+              //   which tries cheap (stabilize + reopenChipModal) FIRST and
+              //   only falls back to replay if cheap fails. Guarantees modal
+              //   is open afterwards so the real target walk doesn't fail
+              //   with "modal not open". Watch reopen_stats.replay -- if it
+              //   climbs, the cheap path needs more investigation.
               try {
-                const _stabOk = await stabilizeBackToTerminal(ft.terminal_node);
-                if (_stabOk) await W.reopenChipModal('turn');
+                const _er = await ensureTurnModalAtTerminal();
+                if (!_er.ok) {
+                  result.warnings.push(`post-partial-walk cleanup at ${ft.terminal_node}: ${_er.path}`);
+                }
               } catch (e) {
                 result.warnings.push(`post-partial-walk cleanup at ${ft.terminal_node}: ${e.message}`);
               }
