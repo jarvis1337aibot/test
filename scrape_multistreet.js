@@ -489,6 +489,10 @@
     //   Cross-chat handoff still works via __msDumpResumeCapsule (in-memory
     //   capsule, no file emission).
 
+    // v9.17 (2026-05-26): snapshot the captured-requests array index at
+    // session start so __msBuildSessionRecord can compute the actual
+    // /range/url call count for THIS session (vs the cumulative tab total).
+    window.__msSessionStartReqIndex = (window._capturedRequests || []).length;
     window.__msProgress = {
       phase: 'starting', t_start: Date.now(),
       nodes_walked: 0, zips_emitted: 0,
@@ -1964,6 +1968,17 @@
       cards_planned_n = Object.values(cfg.target_cards_per_terminal)
         .reduce(function(s, a) { return s + (Array.isArray(a) ? a.length : 0); }, 0);
     } else cards_planned_n = zipNames.length;
+    // v9.17 (2026-05-26): compute true quota usage from the captured-requests
+    // log. n_range_url_calls is the actual /range/url request count for this
+    // session -- the real metric the trainer rate-limits on. n_total_api_calls
+    // counts all execute-api requests (includes blob fetches, etc).
+    const reqStartIdx = (typeof window.__msSessionStartReqIndex === 'number')
+      ? window.__msSessionStartReqIndex : 0;
+    const sessionReqs = ((window._capturedRequests || []).slice(reqStartIdx));
+    const n_range_url_calls = sessionReqs.filter(r =>
+      r && r.url && r.url.includes('/range/url')
+    ).length;
+    const n_total_api_calls = sessionReqs.length;
     const rec = {
       schema_version: '1',
       session_id: cfg.session_id || ('ses-' + (result.tree || 'unknown') + '-' + Date.now()),
@@ -1983,6 +1998,8 @@
       flop_zip_emitted_this_session: flopZipEmittedThisSession,
       captures: captures_n,
       partial_walk_alias_recoveries: window.__msPartialWalkAliasRecoveries || 0,
+      n_range_url_calls: n_range_url_calls,
+      n_total_api_calls: n_total_api_calls,
       human_stats: Object.assign({}, window.__msHumanStats || {}, {
         node_wait_stats: window.__msNodeWaitStats || {},
       }),
@@ -2116,6 +2133,6 @@
     };
   }
 
-  return 'multi-street scraper installed (window.__scrapeMultiStreet, window.__scrapeSession) [v9.14 chain-decomp diagnostic in no_chosen_block; v9.13 stabilize-iter-modal-close + diagnostics + url-prefix-match; v9.8 monotone-rule auto-alias (D/C aliased on monotone S/H boards); v9.11 producer-aware session_record (session_kind=producer for full-flop runs); v9.7.1 session-record-only emit, __msEmitResumeFile removed; v9.7 session-record-emit; tier 2/3 orch: categories-activate + partial-browse + shuffle_cards; tier-1 fixes: all-terminals-cached + per-card-manifest + modal-cleanup; phase 7 emergency-stop hook; phase 4 human-like noise wired (cfg.human_like -> window.__msHumanCfg + turn hover hook); phase 3 session wrapper; phase 2 card maps + target_cards_per_terminal; phase 1 session mode (zip_per_card + device_name + session_id); post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
+  return 'multi-street scraper installed (window.__scrapeMultiStreet, window.__scrapeSession) [v9.17 true-quota-counter (n_range_url_calls per session); v9.14 chain-decomp diagnostic in no_chosen_block; v9.13 stabilize-iter-modal-close + diagnostics + url-prefix-match; v9.8 monotone-rule auto-alias (D/C aliased on monotone S/H boards); v9.11 producer-aware session_record (session_kind=producer for full-flop runs); v9.7.1 session-record-only emit, __msEmitResumeFile removed; v9.7 session-record-emit; tier 2/3 orch: categories-activate + partial-browse + shuffle_cards; tier-1 fixes: all-terminals-cached + per-card-manifest + modal-cleanup; phase 7 emergency-stop hook; phase 4 human-like noise wired (cfg.human_like -> window.__msHumanCfg + turn hover hook); phase 3 session wrapper; phase 2 card maps + target_cards_per_terminal; phase 1 session mode (zip_per_card + device_name + session_id); post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
 })();
 
