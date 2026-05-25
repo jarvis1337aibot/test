@@ -73,17 +73,32 @@
     if (!window.__msFetchPatched) {
       const origFetch = window.fetch;
       window.fetch = function(input, init) {
+        let _capturedUrl = null;
         try {
           const url = typeof input === 'string' ? input : (input && input.url);
+          _capturedUrl = url;
           const method = (init && init.method) || (input && input.method) || 'GET';
           let headers = {};
           if (init && init.headers) { new Headers(init.headers).forEach((v, k) => headers[k] = v); }
           else if (input && input.headers) { try { input.headers.forEach((v, k) => headers[k] = v); } catch (e) {} }
           if (url && url.includes('execute-api')) note({ source: 'fetch', url, method, headers, t: Date.now() });
         } catch (e) {}
-        return origFetch.apply(this, arguments);
+        // v9.9 (2026-05-24): inspect response. 429 on any trainer /range/url
+        // request -> flag __msQuotaExceeded so orchestrator aborts cleanly
+        // with exit_reason='quota_exceeded' instead of silent stall.
+        return origFetch.apply(this, arguments).then(function(response) {
+          try {
+            if (response && response.status === 429 && _capturedUrl &&
+                (_capturedUrl.includes('execute-api') ||
+                 _capturedUrl.includes('/range/url'))) {
+              flagQuotaExceeded('UI fetch HTTP 429 on ' + _capturedUrl);
+            }
+          } catch (_) {}
+          return response;
+        }, function(err) { throw err; });
       };
       window.__msFetchPatched = true;
+      window.__msV99QuotaDetectInstalled = true;
     }
     if (!window.__msXhrPatched) {
       const origOpen = XMLHttpRequest.prototype.open;
@@ -101,6 +116,19 @@
         if (this.__url && this.__url.includes('execute-api')) {
           note({ source: 'xhr', url: this.__url, method: this.__method, headers: this.__headers, t: Date.now() });
         }
+        // v9.9 (2026-05-24): hook 'load' to flag 429 on trainer UI XHRs.
+        const _self = this;
+        try {
+          _self.addEventListener('load', function() {
+            try {
+              if (_self.status === 429 && _self.__url &&
+                  (_self.__url.includes('execute-api') ||
+                   _self.__url.includes('/range/url'))) {
+                flagQuotaExceeded('UI XHR HTTP 429 on ' + _self.__url);
+              }
+            } catch (_) {}
+          });
+        } catch (_) {}
         return origSend.apply(this, arguments);
       };
       window.__msXhrPatched = true;
