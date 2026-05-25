@@ -1556,6 +1556,37 @@
       const card = stripped.slice(idx + 1);
       (cardsPerTerm[terminal] = cardsPerTerm[terminal] || []).push(card);
     }
+    // v9.11 (2026-05-25): producer-mode detection + extra fields.
+    // A producer run has scope='flop+turn' but no target/turn cards; the
+    // orchestrator returns result.workloads_emitted with the 4 partition
+    // summaries. Without this branch the session_record was a 672-byte stub.
+    const isProducerMode = (cfg && (cfg.scope === 'flop+turn') &&
+                            !cfg.target_cards_per_terminal &&
+                            !cfg.turn_cards_per_terminal &&
+                            !cfg.flop_terminal_filter) ||
+                           (Array.isArray(result.workloads_emitted) &&
+                            result.workloads_emitted.length > 0);
+    let producerExtras = null;
+    if (isProducerMode) {
+      const flopNodes = Array.isArray(result.nodes)
+        ? result.nodes.filter(n => n && n.street === 'flop').length
+        : 0;
+      producerExtras = {
+        n_workloads_emitted: (result.workloads_emitted || []).length,
+        workloads_emitted: (result.workloads_emitted || []).map(w => ({
+          workload_id: w.workload_id,
+          partition_index: w.partition_index,
+          partition_count: w.partition_count,
+          terminals: (w.terminals || []).map(t => ({
+            terminal_node: t.terminal_node,
+            assigned_count: t.assigned_count,
+          })),
+        })),
+        n_flop_nodes: flopNodes,
+        n_terminal_card_maps: result.terminal_card_maps
+          ? Object.keys(result.terminal_card_maps).length : 0,
+      };
+    }
     const aliases = (result.aliases || []).map(function(a) {
       return {
         terminal: a.terminal || a.flop_terminal,
@@ -1576,7 +1607,7 @@
       cards_planned_n = Object.values(cfg.target_cards_per_terminal)
         .reduce(function(s, a) { return s + (Array.isArray(a) ? a.length : 0); }, 0);
     } else cards_planned_n = zipNames.length;
-    return {
+    const rec = {
       schema_version: '1',
       session_id: cfg.session_id || ('ses-' + (result.tree || 'unknown') + '-' + Date.now()),
       device: cfg.device_name || 'main',
@@ -1600,8 +1631,18 @@
       }),
       warnings: result.warnings || [],
       workloads_drawn_from: cfg.workloads_drawn_from || spec.workloads_drawn_from || [],
-      session_kind: spec.session_kind || 'scrape',
+      session_kind: isProducerMode ? 'producer' : (spec.session_kind || 'scrape'),
     };
+    // v9.11: bake producer-specific fields into the same record so
+    // ledger.py finalize-session can ingest a producer run without a
+    // separate code path. For producer runs, captures = flop walk node
+    // count (not zip count -- the flop.zip is ONE zip but represents
+    // many node captures).
+    if (producerExtras) {
+      Object.assign(rec, producerExtras);
+      rec.captures = producerExtras.n_flop_nodes;
+    }
+    return rec;
   };
   window.__msEmitSessionRecord = function(rec) {
     try {
@@ -1693,6 +1734,6 @@
     };
   }
 
-  return 'multi-street scraper installed (window.__scrapeMultiStreet, window.__scrapeSession) [v9.8 monotone-rule auto-alias (D/C aliased on monotone S/H boards); v9.7.1 session-record-only emit, __msEmitResumeFile removed; v9.7 session-record-emit; tier 2/3 orch: categories-activate + partial-browse + shuffle_cards; tier-1 fixes: all-terminals-cached + per-card-manifest + modal-cleanup; phase 7 emergency-stop hook; phase 4 human-like noise wired (cfg.human_like -> window.__msHumanCfg + turn hover hook); phase 3 session wrapper; phase 2 card maps + target_cards_per_terminal; phase 1 session mode (zip_per_card + device_name + session_id); post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
+  return 'multi-street scraper installed (window.__scrapeMultiStreet, window.__scrapeSession) [v9.8 monotone-rule auto-alias (D/C aliased on monotone S/H boards); v9.11 producer-aware session_record (session_kind=producer for full-flop runs); v9.7.1 session-record-only emit, __msEmitResumeFile removed; v9.7 session-record-emit; tier 2/3 orch: categories-activate + partial-browse + shuffle_cards; tier-1 fixes: all-terminals-cached + per-card-manifest + modal-cleanup; phase 7 emergency-stop hook; phase 4 human-like noise wired (cfg.human_like -> window.__msHumanCfg + turn hover hook); phase 3 session wrapper; phase 2 card maps + target_cards_per_terminal; phase 1 session mode (zip_per_card + device_name + session_id); post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
 })();
 

@@ -1,4 +1,4 @@
-/* scrape_ui_nav.js -- UI-driven scenario picker navigation (v9.10.2, 2026-05-25 (flop-only fast path) (Heads Up skip pos + rank-only flop match))
+/* scrape_ui_nav.js -- UI-driven scenario picker navigation (v9.10.4, 2026-05-25 (verifyDialogClosed + lenient flop matcher + URL fallback) (flop-only fast path) (Heads Up skip pos + rank-only flop match))
  *
  * Installs window.__navigateToFlopViaUI(spec) which clicks through the
  * trainer's "Select scenario" modal instead of relying on direct URL
@@ -100,6 +100,80 @@
     }
     return null;
   }
+
+  /**
+   * v9.10.3 (2026-05-25): after any picker interaction (scenario row click,
+   * flop pick, etc.), the modal SHOULD close. Sometimes it lingers (race
+   * with React state update / animation), which causes the next click to
+   * miss the underlying page or hit the stale dialog instead.
+   *
+   * verifyDialogClosed: wait up to timeout_ms for the dialog to disappear
+   * (no visible <h4> heading inside .modal-root). If still present, force
+   * close via:
+   *   1. Escape key dispatched to document
+   *   2. Click on the outer overlay (the .fixed.inset-0 div behind the card)
+   *   3. Click on a close-button if one is present
+   * Returns true if the dialog ended up closed, false if all attempts failed.
+   */
+  async function verifyDialogClosed(opts, timeout_ms) {
+    timeout_ms = (typeof timeout_ms === 'number') ? timeout_ms : 5000;
+    function isClosed() {
+      const d = getDialog();
+      if (!d) return true;
+      // Dialog element may exist but be empty when "closed". Look for any
+      // visible <h4> heading inside as a proxy for "picker still open".
+      const h4 = d.querySelector('h4');
+      if (!h4) return true;
+      const r = h4.getBoundingClientRect();
+      return r.width === 0 || r.height === 0;
+    }
+    const start = Date.now();
+    while (Date.now() - start < timeout_ms) {
+      if (isClosed()) return true;
+      await sleep(200);
+    }
+    // Still open. Try Escape first (cheapest).
+    try {
+      document.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true,
+      }));
+      await sleep(500);
+      if (isClosed()) return true;
+    } catch (_) {}
+    // Try clicking the modal overlay (the .fixed.inset-0 backdrop).
+    try {
+      const dialog = getDialog();
+      if (dialog) {
+        let overlay = null;
+        dialog.querySelectorAll('div').forEach(d => {
+          const cls = (d.className || '').toString();
+          if (/fixed/.test(cls) && /inset-0/.test(cls)) overlay = overlay || d;
+        });
+        if (overlay) {
+          overlay.click();
+          await sleep(500);
+          if (isClosed()) return true;
+        }
+      }
+    } catch (_) {}
+    // Try clicking a close (X) button if the modal exposes one.
+    try {
+      const dialog = getDialog();
+      if (dialog) {
+        const closeBtn = dialog.querySelector(
+          'button[aria-label*="close" i], button[aria-label*="lose" i], ' +
+          '[class*="close-button" i], [class*="closeBtn" i], button[class*="x-close" i]'
+        );
+        if (closeBtn) {
+          closeBtn.click();
+          await sleep(500);
+          if (isClosed()) return true;
+        }
+      }
+    } catch (_) {}
+    return isClosed();
+  }
+  window.__msVerifyDialogClosed = verifyDialogClosed;
 
   /**
    * Inside the open dialog, find the option button with the given text
@@ -327,29 +401,117 @@
     await typeLetterByLetter(flopInput, flop, opts);
     // Wait for list to filter
     await sleep(800);
-    // Extract ranks from the 6-char flop (positions 0, 2, 4)
+    // v9.10.4 (2026-05-25): more lenient row match. The old logic required
+    //   (a) startsWith(ranks[0]), (b) cursor-pointer class on the row itself,
+    //   (c) row positioned just below the input.
+    // Failure case observed on AhJd7h: matcher returned no row even though
+    // the flop was selectable. New approach:
+    //   - Don't require startsWith — just include() ALL 3 ranks AND no other
+    //     non-ranking text bleed.
+    //   - If the leaf element with ranks isn't clickable, walk up to find a
+    //     clickable ancestor (cursor-pointer / <button> / role=button).
+    //   - Search the whole dialog, not just below the input.
+    //   - Score candidates by Y-proximity to input and tightness of rank-only
+    //     text (no extra digit/letter noise beyond ranks + question-marks).
     const ranks = [flop[0], flop[2], flop[4]];
+    const ranksSet = new Set(ranks);
+    function isClickable(el) {
+      if (!el) return false;
+      const tag = (el.tagName || '').toLowerCase();
+      const cls = (el.className || '').toString();
+      const role = el.getAttribute && el.getAttribute('role');
+      return tag === 'button' || tag === 'a' || role === 'button' || /cursor-pointer/.test(cls);
+    }
+    function walkUpClickable(el, max) {
+      max = max || 6;
+      let c = el;
+      for (let k = 0; k < max && c; k++) {
+        if (isClickable(c)) return c;
+        c = c.parentElement;
+      }
+      return null;
+    }
     const dialog = document.querySelector('dialog.modal-root');
     const ir = flopInput.getBoundingClientRect();
-    let matchEl = null;
-    dialog.querySelectorAll('div, button, li').forEach(el => {
-      const r = el.getBoundingClientRect();
-      if (r.top < ir.bottom + 4) return;
-      if (r.left < ir.left - 60 || r.left > ir.left + 400) return;
-      if (r.width === 0 || r.height === 0) return;
-      const cls = (el.className || '').toString();
-      if (!/cursor-pointer/.test(cls)) return;
+    let candidates = [];
+    // Pass 1: scan ALL elements whose textContent contains all 3 ranks and is
+    // short (<= 20 chars, the typical flop row).
+    dialog.querySelectorAll('div, button, li, tr, span').forEach(el => {
       const txt = (el.innerText || '').trim();
-      if (!txt) return;
-      // Row must START with the first rank (e.g. "8") and contain all 3 ranks.
-      // The textContent for a 3-card flop is typically "<r1>\n<r2>\n<r3>\n?\n?".
-      if (!txt.startsWith(ranks[0])) return;
-      const seen = ranks.every(rk => txt.includes(rk));
-      if (!seen) return;
-      if (!matchEl || r.top < matchEl.getBoundingClientRect().top) matchEl = el;
+      if (!txt || txt.length > 30) return;
+      // Strip whitespace and the suit-icon glyphs (which appear as '?' in
+      // textContent when rendered as SVG/img). What's left should be just
+      // the three ranks.
+      const stripped = txt.replace(/\s+|\?/g, '');
+      if (stripped.length !== 3) return;
+      const present = stripped.split('').every(ch => ranksSet.has(ch));
+      if (!present) return;
+      const all3 = ranks.every(rk => stripped.includes(rk));
+      if (!all3) return;
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) return;
+      // Resolve to clickable ancestor if leaf isn't clickable itself.
+      const click = isClickable(el) ? el : walkUpClickable(el);
+      if (!click) return;
+      const cr = click.getBoundingClientRect();
+      // Score by Y-proximity to input (below preferred)
+      const dy = cr.top - ir.bottom;
+      const score = dy >= 0 ? dy : (Math.abs(dy) + 1000);  // penalize above-input
+      candidates.push({ click, leaf: el, score, leafText: txt });
     });
-    if (!matchEl) throw new Error(`no flop-list row matches ranks of "${flop}" (suits are visual icons; matching by rank text)`);
+    candidates.sort((a, b) => a.score - b.score);
+    let matchEl = candidates.length ? candidates[0].click : null;
+
+    // Pass 2 (fallback): if no candidate, try the legacy strict match in case
+    // the row has noise after the ranks (e.g. score icons).
+    if (!matchEl) {
+      dialog.querySelectorAll('div, button, li, tr').forEach(el => {
+        const r = el.getBoundingClientRect();
+        if (r.top < ir.bottom + 4) return;
+        if (r.width === 0) return;
+        const txt = (el.innerText || '').trim();
+        if (!txt) return;
+        if (!ranks.every(rk => txt.includes(rk))) return;
+        const click = isClickable(el) ? el : walkUpClickable(el);
+        if (!click) return;
+        if (!matchEl || click.getBoundingClientRect().top < matchEl.getBoundingClientRect().top) {
+          matchEl = click;
+        }
+      });
+    }
+
+    if (!matchEl) {
+      // v9.10.4 fallback: direct URL navigation when UI matcher fails.
+      //   The cron debrief on 2026-05-25 observed this failure on AhJd7h —
+      //   the user (Claude in the spawned chat) had to fall back to direct
+      //   URL nav manually. Bake that fallback in so it auto-recovers.
+      warnings.push(`flop matcher found no row for "${flop}" (typed value "${flopInput.value}"); ` +
+                    `falling back to direct URL navigation`);
+      // Try to close the picker dialog cleanly before navigating
+      try { await verifyDialogClosed(opts, 3000); } catch (_) {}
+      const u = new URL(location.href);
+      u.searchParams.set('flop', flop);
+      u.searchParams.set('type', 'postflop');
+      // Tree/host already correct (we navigated via the picker successfully
+      // for the scenario; only the flop pick failed).
+      location.href = u.toString();
+      // Wait for the page to land on the new URL
+      const start = Date.now();
+      while (Date.now() - start < 8000) {
+        await sleep(300);
+        if (new URL(location.href).searchParams.get('flop') === flop) break;
+      }
+      return;
+    }
     await clickAndPace(matchEl, opts);
+    // v9.10.3: confirm the popup closed after the flop pick. If it lingers,
+    // force-close via Escape/overlay/close-button. Surfacing a warning so
+    // the caller knows the dialog needed a nudge.
+    const closed = await verifyDialogClosed(opts, 5000);
+    if (!closed) {
+      warnings.push('flop-pick dialog did not close cleanly after match click ' +
+                    'and could not be force-closed -- next click may misfire');
+    }
   }
 
   /**
@@ -409,6 +571,14 @@
     await typeFlopAndPick(spec.flop, opts, warnings);
     stepsCompleted.push('flop_picked');
 
+    // v9.10.3: belt-and-suspenders — ensure no picker dialog is still open
+    // after the full navigation completes (would block any subsequent walker
+    // calls that try to interact with the page).
+    const finalClosed = await verifyDialogClosed(opts, 3000);
+    if (!finalClosed) {
+      warnings.push('a picker dialog is still open after navigation completed; ' +
+                    'this may block subsequent walker interactions');
+    }
     // Wait for navigation to settle
     await sleep(1500);
     const final_url = new URL(location.href);
@@ -430,6 +600,6 @@
 
   window.__msUiNavInstalled = true;
   try {
-    console.log('[ui-nav v9.10.2] installed __navigateToFlopViaUI(spec)');
+    console.log('[ui-nav v9.10.4] installed __navigateToFlopViaUI(spec)');
   } catch (_) {}
 })();
