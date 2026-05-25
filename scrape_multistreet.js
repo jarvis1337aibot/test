@@ -178,20 +178,32 @@
     // POST-TIER-9 FIX v9.4 (2026-05-24): per-click wait 700ms -> 2000ms,
     //   and if the URL doesn't change after a click, retry ONCE before
     //   bailing. Tolerates slow VPN + React render lag during navigation.
+    // v9.12 (2026-05-25): added a THIRD attempt with 5s wait before bailing,
+    //   to tolerate deep terminals (4+ segments like C-R50-R75-C) where the
+    //   trainer's React re-render lags more than 2s. Also logs each retry to
+    //   result.events via window.__msProgress.stabilize_log so post-run
+    //   diagnostics can see which step failed.
     if (W.modalKind()) await W.closeModalX();
     if (W.urlNode() === ftTerminalNode) return true;
+    const logEntry = (kind, detail) => {
+      try {
+        window.__msProgress.stabilize_log = window.__msProgress.stabilize_log || [];
+        window.__msProgress.stabilize_log.push({ t: Date.now(), kind, target: ftTerminalNode, ...detail });
+        if (window.__msProgress.stabilize_log.length > 200) window.__msProgress.stabilize_log.shift();
+      } catch (_) {}
+    };
     let safety = 0;
     while (safety++ < 30) {
       const blocks = W.readBlocks();
       let target = null;
       for (const b of blocks) { if (b.actions.some(a => a.chosen)) target = b; }
-      if (!target) return false;
+      if (!target) { logEntry('no_chosen_block', { safety, at: W.urlNode() }); return false; }
       const before = W.urlNode();
       target.headerEl.click();
       await sleep(2000);
-      // If URL didn't change, give it ONE more chance (re-read blocks +
-      //   click again — the headerEl might be stale after a partial re-render).
+      // Attempt 2: re-read blocks + click again (headerEl might be stale).
       if (W.urlNode() === before) {
+        logEntry('attempt2_after_2s', { safety, before, still_at: W.urlNode() });
         const blocks2 = W.readBlocks();
         let target2 = null;
         for (const b of blocks2) { if (b.actions.some(a => a.chosen)) target2 = b; }
@@ -199,13 +211,30 @@
           target2.headerEl.click();
           await sleep(2000);
         }
-        if (W.urlNode() === before) return false; // truly stuck
+        // Attempt 3 (v9.12): one more re-read + 5s wait before giving up —
+        //   this is the slow-VPN / deep-terminal escape hatch.
+        if (W.urlNode() === before) {
+          logEntry('attempt3_after_5s', { safety, before, still_at: W.urlNode() });
+          const blocks3 = W.readBlocks();
+          let target3 = null;
+          for (const b of blocks3) { if (b.actions.some(a => a.chosen)) target3 = b; }
+          if (target3 && target3.headerEl) {
+            target3.headerEl.click();
+            await sleep(5000);
+          }
+          if (W.urlNode() === before) {
+            logEntry('truly_stuck_after_attempt3', { safety, before, still_at: W.urlNode() });
+            return false;
+          }
+          logEntry('attempt3_succeeded', { safety, before, now: W.urlNode() });
+        }
       }
       if (W.urlNode() === ftTerminalNode) {
         if (W.modalKind()) await W.closeModalX();
         return true;
       }
     }
+    logEntry('safety_overflow', { safety, at: W.urlNode() });
     return false;
   }
 
@@ -1457,11 +1486,23 @@
         result.aborted_by_user = true;
       }
       result.summary.reopen_stats = window.__msProgress.reopen_stats;
+      // v9.12 (2026-05-25): persist stabilize log into the result for post-run diagnostics.
+      result.stabilize_log = (window.__msProgress.stabilize_log || []).slice();
       try { if (W.modalKind && W.modalKind()) { await W.closeModalX(); } } catch (_) {}
       result.finished_at = new Date().toISOString();
       result.elapsed_s = Math.round((Date.now() - window.__msProgress.t_start) / 1000);
       window.__msProgress.phase = window.__msQuotaExceeded ? 'aborted_quota' : (window.__msAborted ? 'aborted_user' : 'done');
       window.__msResult = result;
+      // v9.12 (2026-05-25): debug capture — stash on window so post-run inspection
+      //   survives even if the orchestrator clears its own globals.
+      try {
+        window.__msLastResult = result;
+        window.__msLastEvents = (result.events || []).slice(-200);
+        window.__msLastWarnings = (result.warnings || []).slice();
+        window.__msLastStabilizeLog = (result.stabilize_log || []).slice();
+        window.__msLastCfg = cfg;
+        window.__msLastFinishedAt = result.finished_at;
+      } catch (_) {}
       saveCheckpoint(buildCheckpoint({ last_event: 'run_finished' }));
       return result;
     } catch (e) {
@@ -1534,6 +1575,219 @@
   //   flop_zip_emitted_this_session, captures,
   //   partial_walk_alias_recoveries, human_stats, warnings,
   //   workloads_drawn_from, session_kind.
+  // ============== v9.12 (2026-05-25) HUMAN-READABLE SESSION REPORT ==============
+  function isMonotoneFlop(flop) {
+    if (!flop || typeof flop !== 'string') return false;
+    const suits = (flop.match(/[shdc]/g) || []);
+    if (suits.length < 3) return false;
+    return suits[0] === suits[1] && suits[1] === suits[2];
+  }
+  window.__msBuildSessionReport = function(rec, result, cfg) {
+    rec = rec || {}; result = result || {}; cfg = cfg || {};
+    const lines = [];
+    const anomalies = [];
+    const successes = [];
+
+    const flop = rec.flop || result.flop || '(unknown flop)';
+    const tree = rec.tree || result.tree || '(unknown tree)';
+    const sid  = rec.session_id || '(unknown session)';
+    const monotone = isMonotoneFlop(flop);
+
+    lines.push('# Scraper Session Report');
+    lines.push('');
+    lines.push('- **session_id**: `' + sid + '`');
+    lines.push('- **device**: `' + (rec.device || '(none)') + '`');
+    lines.push('- **tree**: `' + tree + '`');
+    lines.push('- **flop**: `' + flop + '` ' + (monotone ? '(monotone — suitMap aliases are expected)' : '(non-monotone — suitMap aliases should NOT auto-trigger)'));
+    lines.push('- **started_at**: ' + (rec.started_at || '(unknown)'));
+    lines.push('- **finished_at**: ' + (rec.finished_at || '(unknown)'));
+    lines.push('- **elapsed_s**: ' + (rec.elapsed_s != null ? rec.elapsed_s : '(unknown)'));
+    lines.push('- **exit_reason**: `' + (rec.exit_reason || '(unknown)') + '`');
+    lines.push('');
+
+    const cardsPlanned = rec.cards_planned || 0;
+    const cardsWalked  = rec.cards_walked  || 0;
+    const capturesN    = rec.captures || 0;
+    const reopen = (result.summary && result.summary.reopen_stats) || { cheap: 0, replay: 0, failed: 0 };
+    const aliases = rec.aliases || [];
+    const warnings = rec.warnings || [];
+    const stabilizeLog = result.stabilize_log || [];
+    const stuckEntries = stabilizeLog.filter(e => e && (e.kind === 'truly_stuck_after_attempt3' || e.kind === 'safety_overflow' || e.kind === 'no_chosen_block'));
+    const attempt3Recovered = stabilizeLog.filter(e => e && e.kind === 'attempt3_succeeded').length;
+    const attempt2Triggered = stabilizeLog.filter(e => e && e.kind === 'attempt2_after_2s').length;
+
+    if (cardsPlanned > 0 && cardsWalked < cardsPlanned) {
+      anomalies.push('WARN  **Cards walked < cards planned** -- planned `' + cardsPlanned + '`, walked `' + cardsWalked + '` (`' + (cardsPlanned - cardsWalked) + '` missing). Check `cards_per_terminal` and `aliases`.');
+    } else if (cardsPlanned > 0) {
+      successes.push('OK  All planned cards walked (`' + cardsWalked + '/' + cardsPlanned + '`).');
+    }
+
+    if (reopen.failed > 0) {
+      anomalies.push('WARN  **Reopen failures**: `failed=' + reopen.failed + '`. Walker bailed on modal reopen -- check warnings for which terminal/card.');
+    }
+    if (reopen.replay > 0) {
+      if (monotone) {
+        successes.push('OK  `replay=' + reopen.replay + '` replays on a monotone board -- likely the urlSuitMap forced-replay guard, which is expected.');
+      } else {
+        anomalies.push('WARN  **Unexpected replays on non-monotone board**: `replay=' + reopen.replay + '`, `cheap=' + reopen.cheap + '`. On `' + flop + '` (non-monotone), the suitMap auto-alias guard should NOT fire. These replays came from the cheap-fallback path (stabilizeBackToTerminal or reopenChipModal failed). Inspect `stabilize_log` in the JSON for which step bailed.');
+      }
+    }
+    if (reopen.cheap > 0 && reopen.replay === 0 && reopen.failed === 0) {
+      successes.push('OK  All `' + reopen.cheap + '` reopens used the fast cheap path.');
+    }
+
+    if (attempt3Recovered > 0) {
+      anomalies.push('INFO  **Stabilize attempt 3 (5s wait) recovered ' + attempt3Recovered + ' time(s)** -- the 2s+2s retries were not enough, but 5s was. If this fires often, consider bumping default wait.');
+    }
+    if (attempt2Triggered > 0 && attempt3Recovered === 0 && stuckEntries.length === 0) {
+      successes.push('OK  Stabilize attempt 2 (2s) recovered ' + attempt2Triggered + ' time(s); 5s fallback was never needed.');
+    }
+    if (stuckEntries.length > 0) {
+      anomalies.push('WARN  **Stabilize fully stuck `' + stuckEntries.length + '` time(s)** -- URL did not change after even the 5s third attempt. Caused replay-from-root. Sample: ```' + JSON.stringify(stuckEntries.slice(0, 3)) + '```');
+    }
+
+    if (aliases.length > 0) {
+      if (monotone) {
+        successes.push('OK  `' + aliases.length + '` alias(es) recorded (expected on monotone board).');
+      } else {
+        anomalies.push('INFO  **`' + aliases.length + '` alias(es) on non-monotone board** -- trainer canonicalized some cards. Not a bug, but worth eyeballing: ' + aliases.slice(0, 5).map(a => '`' + (a.requested || '?') + '->' + (a.canonical || '?') + '`').join(', '));
+      }
+    }
+
+    const dimCards = rec.dim_cards || {};
+    const dimTotal = Object.values(dimCards).reduce((s, arr) => s + (Array.isArray(arr) ? arr.length : 0), 0);
+    if (dimTotal > 0) {
+      anomalies.push('INFO  **`' + dimTotal + '` dim/no-sim card(s)** -- trainer had no sim available. Per terminal: `' + JSON.stringify(dimCards) + '`.');
+    }
+
+    const events = result.events || [];
+    const zeroWalkEvents = events.filter(e => e && (e.event === 'zero_walk_detected' || e.event === 'turn_card_skipped_empty'));
+    const zeroWalkCircuitBreakers = events.filter(e => e && e.event === 'zero_walk_circuit_breaker_hard_reset');
+    if (zeroWalkEvents.length > 0) {
+      anomalies.push('WARN  **`' + zeroWalkEvents.length + '` zero-walk event(s)** -- turn DFS recorded zero nodes for some card(s). Likely click race or DOM transient. Cards: ' + zeroWalkEvents.slice(0, 8).map(e => '`' + (e.terminal || '?') + '/' + (e.card || '?') + '`').join(', '));
+    }
+    if (zeroWalkCircuitBreakers.length > 0) {
+      anomalies.push('WARN  **`' + zeroWalkCircuitBreakers.length + '` zero-walk circuit-breaker hard reset(s)** -- three consecutive zero walks triggered a navigation reset.');
+    }
+
+    const suitMapForced = events.filter(e => e && e.event === 'suitmap_persisted_forcing_full_replay');
+    if (suitMapForced.length > 0) {
+      if (monotone) {
+        successes.push('OK  `' + suitMapForced.length + '` suitMap forced-replay(s) on monotone board (expected).');
+      } else {
+        anomalies.push('WARN  **suitMap forced-replay on non-monotone board** -- `' + suitMapForced.length + '` fired on `' + flop + '`. The trainer DID persist `&suitMap=` for at least one card on a non-monotone flop. Cards: ' + suitMapForced.slice(0, 5).map(e => '`' + (e.terminal || '?') + ' suitMap=' + (e.suitMap || '?') + '`').join(', '));
+      }
+    }
+
+    if (rec.exit_reason === 'emergency_stop') {
+      anomalies.push('STOP  **Emergency stop fired** -- check `archive/emergency_stops/` for the dump file.');
+    } else if (rec.exit_reason === 'quota_exceeded') {
+      anomalies.push('PAUSE  **Quota exceeded** -- trainer returned a quota error. Resume after midnight UTC.');
+    } else if (rec.exit_reason === 'user_abort') {
+      anomalies.push('PAUSE  **User abort** -- `window.__msAborted` was set during the run.');
+    } else if (rec.exit_reason === 'error') {
+      anomalies.push('STOP  **Run errored** -- see `result.error` in the JSON.');
+    } else if (rec.exit_reason === 'session_complete') {
+      successes.push('OK  Session completed cleanly (`exit_reason=session_complete`).');
+    }
+
+    if (!cfg.skip_flop_walk) {
+      const nodes = result.nodes || [];
+      const flopNodes = nodes.filter(n => n && n.street === 'flop');
+      const rootNode = flopNodes.find(n => !n.node || n.node === '');
+      if (flopNodes.length > 0 && !rootNode) {
+        anomalies.push('WARN  **Root node not recorded** -- flop walk produced `' + flopNodes.length + '` nodes but the root `(none)` node is missing. Check `nodes[0]` and the flop zip contents.');
+      } else if (rootNode) {
+        successes.push('OK  Root flop node recorded.');
+      }
+    }
+
+    if (warnings.length > 0) {
+      const nonRoutine = warnings.filter(w => !/^reopen modal after walking .* failed/.test(String(w)));
+      if (nonRoutine.length > 0) {
+        anomalies.push('INFO  **`' + warnings.length + '` warning(s) in `result.warnings`** (' + nonRoutine.length + ' non-routine). See section below.');
+      }
+    } else {
+      successes.push('OK  No warnings recorded.');
+    }
+
+    const zipsList = rec.zips_emitted || [];
+    if (zipsList.length > 0) {
+      successes.push('OK  Emitted `' + zipsList.length + '` zip(s); `' + capturesN + '` capture(s) recorded.');
+    } else if (cardsPlanned > 0) {
+      anomalies.push('WARN  **No zips emitted** -- planned `' + cardsPlanned + '` cards but `0` zips.');
+    }
+
+    lines.push('## TL;DR');
+    lines.push('');
+    if (anomalies.length === 0) {
+      lines.push('**No anomalies detected.** ' + successes.length + ' things went right.');
+    } else {
+      lines.push('**' + anomalies.length + ' anomal' + (anomalies.length === 1 ? 'y' : 'ies') + ' to review.** ' + successes.length + ' things went right.');
+    }
+    lines.push('');
+
+    if (anomalies.length > 0) {
+      lines.push('## Anomalies / Things to review');
+      lines.push('');
+      anomalies.forEach(a => { lines.push('- ' + a); });
+      lines.push('');
+    }
+    if (successes.length > 0) {
+      lines.push('## Things that went right');
+      lines.push('');
+      successes.forEach(s => { lines.push('- ' + s); });
+      lines.push('');
+    }
+
+    lines.push('## Counters');
+    lines.push('');
+    lines.push('| Metric | Value |');
+    lines.push('|---|---|');
+    lines.push('| cards_planned | ' + cardsPlanned + ' |');
+    lines.push('| cards_walked | ' + cardsWalked + ' |');
+    lines.push('| captures | ' + capturesN + ' |');
+    lines.push('| zips_emitted | ' + (rec.zips_emitted || []).length + ' |');
+    lines.push('| reopen.cheap | ' + (reopen.cheap || 0) + ' |');
+    lines.push('| reopen.replay | ' + (reopen.replay || 0) + ' |');
+    lines.push('| reopen.failed | ' + (reopen.failed || 0) + ' |');
+    lines.push('| stabilize.attempt2_triggered | ' + attempt2Triggered + ' |');
+    lines.push('| stabilize.attempt3_recovered | ' + attempt3Recovered + ' |');
+    lines.push('| stabilize.truly_stuck | ' + stuckEntries.length + ' |');
+    lines.push('| aliases | ' + aliases.length + ' |');
+    lines.push('| dim_cards | ' + dimTotal + ' |');
+    lines.push('| zero_walk_events | ' + zeroWalkEvents.length + ' |');
+    lines.push('| warnings | ' + warnings.length + ' |');
+    lines.push('');
+
+    if (Object.keys(rec.cards_per_terminal || {}).length > 0) {
+      lines.push('## Cards walked per terminal');
+      lines.push('');
+      lines.push('| Terminal | Cards |');
+      lines.push('|---|---|');
+      for (const term of Object.keys(rec.cards_per_terminal)) {
+        const cards = rec.cards_per_terminal[term] || [];
+        lines.push('| `' + term + '` | ' + cards.map(c => '`' + c + '`').join(', ') + ' (' + cards.length + ') |');
+      }
+      lines.push('');
+    }
+
+    if (warnings.length > 0) {
+      lines.push('## Full warnings list');
+      lines.push('');
+      lines.push('```');
+      warnings.slice(0, 50).forEach(w => { lines.push(String(w)); });
+      if (warnings.length > 50) lines.push('... (' + (warnings.length - 50) + ' more truncated)');
+      lines.push('```');
+      lines.push('');
+    }
+
+    lines.push('---');
+    lines.push('');
+    lines.push('_Generated by `__msBuildSessionReport` v9.12 (2026-05-25)._');
+    return lines.join('\n');
+  };
+
   window.__msBuildSessionRecord = function(spec, cfg, result) {
     spec = spec || {}; cfg = cfg || {}; result = result || {};
     const cardsPerTerm = {};
@@ -1644,7 +1898,9 @@
     }
     return rec;
   };
-  window.__msEmitSessionRecord = function(rec) {
+  window.__msEmitSessionRecord = function(rec, opts) {
+    opts = opts || {};
+    let jsonOk = false, reportOk = false;
     try {
       const blob = new Blob([JSON.stringify(rec, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
@@ -1655,11 +1911,34 @@
       document.body.appendChild(a);
       a.click();
       setTimeout(function() { URL.revokeObjectURL(url); a.remove(); }, 30000);
-      return true;
+      jsonOk = true;
     } catch (e) {
-      try { console.warn('[v9.7] __msEmitSessionRecord failed:', e && e.message); } catch (_) {}
-      return false;
+      try { console.warn('[v9.7] __msEmitSessionRecord (json) failed:', e && e.message); } catch (_) {}
     }
+    // v9.12 (2026-05-25): always also emit the human-readable .report.md alongside the JSON.
+    if (!opts.skip_report) {
+      try {
+        const result = (opts && opts.result) || window.__msLastResult || window.__msResult || {};
+        const cfg    = (opts && opts.cfg)    || window.__msLastCfg    || {};
+        const md = (typeof window.__msBuildSessionReport === 'function')
+          ? window.__msBuildSessionReport(rec, result, cfg)
+          : '# Report unavailable\n\n__msBuildSessionReport is not installed.';
+        window.__msLastReportMd = md;
+        const blobMd = new Blob([md], { type: 'text/markdown' });
+        const urlMd = URL.createObjectURL(blobMd);
+        const a2 = document.createElement('a');
+        a2.href = urlMd;
+        a2.download = rec.session_id + '.report.md';
+        a2.style.display = 'none';
+        document.body.appendChild(a2);
+        a2.click();
+        setTimeout(function() { URL.revokeObjectURL(urlMd); a2.remove(); }, 30000);
+        reportOk = true;
+      } catch (e) {
+        try { console.warn('[v9.12] __msEmitSessionRecord (report.md) failed:', e && e.message); } catch (_) {}
+      }
+    }
+    return jsonOk && (opts.skip_report || reportOk);
   };
   window.__msV97SessionRecordInstalled = true;
 
