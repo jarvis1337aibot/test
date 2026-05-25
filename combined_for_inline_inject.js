@@ -1,23 +1,21 @@
 /* combined_for_inline_inject.js -- hand-scraper-postflop-flop-turn
  *
- * v9.10.1 (2026-05-25): UI-nav fixes from live testing.
- *   (a) Heads Up implicitly hides First/Second Position rows in the picker —
- *       helper now SKIPS those clicks when n_players === 2.
- *   (b) Flop list rows render suits as visual icons (not text); flop match
- *       now keys on the 3 ranks (positions 0,2,4 of the flop string) rather
- *       than the literal "8s6s2s" string, which doesn't appear in textContent.
- *   Also: flop-search input is located by proximity to the "Flop list" h6
- *   header (the popup has multiple Search inputs).
+ * v9.10.2 (2026-05-25): UI-nav adds flop-only fast path.
+ *   When URL already has desired tree+type=postflop, helper skips the
+ *   scenario picker entirely and clicks the FLOP action block to open
+ *   "Select a flop" directly. Saves ~15s per session start when the cron
+ *   task fires sequentially on the same tree. Verified end-to-end:
+ *   8s6s2s -> 7s4c2h on PLO5C_100_2_SB_BB_3BP in ~10 seconds.
  *
+ * v9.10.1: Heads Up skip + rank-only flop match (suits are visual icons).
  * v9.10: __navigateToFlopViaUI(spec) walks the trainer's "Select scenario"
- *   modal click-by-click. Verified end-to-end on PLO5C_100_2_SB_BB_3BP / 8s6s2s.
- *
+ *   modal click-by-click.
  * v9.9: walker 429 detection via fetch+XHR interceptors.
- * v9.8: monotone-board auto-alias rule (D+C cards aliased on monotone S/H).
+ * v9.8: monotone-board auto-alias rule.
  * v9.7.1: __msEmitResumeFile removed.
  * v9.7: __msBuildSessionRecord + __msEmitSessionRecord.
- * v9.6: partialWalkOnTerminal uses pickCardCommit for suitmap auto-recovery.
- * v9.5: picker coalesces cfg.turn_cards_per_terminal as a fallback.
+ * v9.6: partialWalkOnTerminal uses pickCardCommit.
+ * v9.5: picker coalesces cfg.turn_cards_per_terminal as fallback.
  */
 
 /* ==================== 1) WALKER ==================== */
@@ -4934,8 +4932,8 @@
   return { v17_extension_loaded: true };
 })();
 
-/* ==================== 7) UI NAV (v9.10.1) ==================== */
-/* scrape_ui_nav.js -- UI-driven scenario picker navigation (v9.10.1, 2026-05-25 (Heads Up skip pos + rank-only flop match))
+/* ==================== 7) UI NAV (v9.10.2) ==================== */
+/* scrape_ui_nav.js -- UI-driven scenario picker navigation (v9.10.2, 2026-05-25 (flop-only fast path) (Heads Up skip pos + rank-only flop match))
  *
  * Installs window.__navigateToFlopViaUI(spec) which clicks through the
  * trainer's "Select scenario" modal instead of relying on direct URL
@@ -5103,6 +5101,35 @@
       input.dispatchEvent(new Event('change', { bubbles: true }));
       await sleep(randInt(opts.type_ms_min, opts.type_ms_max));
     }
+  }
+
+  /**
+   * Flop-only-change path: when the URL already has the desired tree on
+   * the postflop trainer, just click the FLOP action block (top of the
+   * action timeline) to open the "Select a flop" dialog directly,
+   * skipping the scenario picker.
+   */
+  async function openFlopPickerViaFlopBlock(opts) {
+    // Find the FLOP action block — div whose visible text starts with "FLOP"
+    // and is the wider card (~60-120px wide, ~80+ px tall).
+    let flopBlock = null;
+    document.querySelectorAll('.cursor-pointer, [role="button"], button').forEach(el => {
+      const txt = (el.innerText || '').trim();
+      if (!txt.startsWith('FLOP') || txt.length > 30) return;
+      const r = el.getBoundingClientRect();
+      if (r.width < 60 || r.width > 120 || r.height < 80) return;
+      flopBlock = el;
+    });
+    if (!flopBlock) throw new Error('FLOP action block not found on page');
+    await clickAndPace(flopBlock, opts);
+    const dialog = await waitFor(() => getDialog(), 5000);
+    if (!dialog) throw new Error('"Select a flop" dialog did not open after FLOP block click');
+    // Verify it's the flop popup (h4 "Select a flop") and not the scenario popup
+    const h4 = dialog.querySelector('h4');
+    if (h4 && (h4.textContent || '').trim() !== 'Select a flop') {
+      throw new Error('Expected "Select a flop" dialog but got: ' + (h4.textContent || '').trim());
+    }
+    return dialog;
   }
 
   async function openScenarioPicker(opts) {
@@ -5283,29 +5310,37 @@
     // (A) Make sure we're on the trainer at all
     if (location.host !== 'plo5.plomastermind.com' &&
         location.host !== 'plo4.plomastermind.com') {
-      // Navigate to the right host based on variant
       const host = (filters.variant && filters.variant.startsWith('PLO4'))
         ? 'plo4.plomastermind.com' : 'plo5.plomastermind.com';
       location.href = 'https://' + host + '/';
-      // After href change, this function context ends; caller should re-invoke.
-      // For now we throw so the caller knows to retry.
       throw new Error('Navigated to ' + host + '; re-invoke after page loads');
     }
     stepsCompleted.push('host_ok');
 
-    // (B) Open picker
-    await openScenarioPicker(opts);
-    stepsCompleted.push('picker_opened');
+    // (A2) PATH DETECTION: if the URL already has the desired tree on the
+    //   postflop trainer, skip the scenario picker and use the fast
+    //   flop-only-change path. The trainer's FLOP action block opens the
+    //   "Select a flop" dialog directly. Saves ~15 seconds.
+    const u = new URL(location.href);
+    const curTree = u.searchParams.get('tree');
+    const curType = u.searchParams.get('type');
+    const fastPath = (curTree === spec.tree && curType === 'postflop');
 
-    // Apply filters
-    await applyFiltersForTree(filters, opts, warnings);
-    stepsCompleted.push('filters_applied');
+    if (fastPath) {
+      stepsCompleted.push('path_flop_only');
+      await openFlopPickerViaFlopBlock(opts);
+      stepsCompleted.push('flop_picker_opened');
+    } else {
+      stepsCompleted.push('path_full_picker');
+      await openScenarioPicker(opts);
+      stepsCompleted.push('picker_opened');
+      await applyFiltersForTree(filters, opts, warnings);
+      stepsCompleted.push('filters_applied');
+      await clickFirstScenarioRow(opts);
+      stepsCompleted.push('scenario_row_clicked');
+    }
 
-    // Click scenario row
-    await clickFirstScenarioRow(opts);
-    stepsCompleted.push('scenario_row_clicked');
-
-    // Type flop and pick
+    // Type flop and pick (same for both paths)
     await typeFlopAndPick(spec.flop, opts, warnings);
     stepsCompleted.push('flop_picked');
 
@@ -5330,6 +5365,6 @@
 
   window.__msUiNavInstalled = true;
   try {
-    console.log('[ui-nav v9.10.1] installed __navigateToFlopViaUI(spec)');
+    console.log('[ui-nav v9.10.2] installed __navigateToFlopViaUI(spec)');
   } catch (_) {}
 })();
