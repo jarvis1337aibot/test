@@ -192,12 +192,115 @@
         if (window.__msProgress.stabilize_log.length > 200) window.__msProgress.stabilize_log.shift();
       } catch (_) {}
     };
+    // v9.13 (2026-05-25): track deepest URL we've reached. If any iteration's
+    // URL is a PREFIX-equal of ftTerminalNode plus optional descendant segments,
+    // accept that as "we arrived" -- the strict-equal check was too strict for
+    // deep terminals where the trainer auto-positions URL one segment past.
+    let bestSeen = W.urlNode();
     let safety = 0;
     while (safety++ < 30) {
+      // v9.13 (2026-05-25): close any auto-opened modal AT THE START OF EACH
+      // ITERATION (not just function entry). At deep terminals like
+      // C-R50-R75-C, the trainer auto-opens the turn modal as soon as URL
+      // lands on the terminal node, which steals focus and clears the
+      // 'chosen' highlight from the action panel. Closing first guarantees
+      // the action panel is visible for readBlocks.
+      if (W.modalKind()) { try { await W.closeModalX(); } catch (_) {} await sleep(300); }
+      // v9.13 (2026-05-25): early-exit if we already reached terminal (URL
+      // exactly matches OR is a descendant of terminal -- the latter is
+      // common when the modal auto-positions URL).
+      const nowUrl = W.urlNode();
+      if (nowUrl === ftTerminalNode) {
+        if (W.modalKind()) await W.closeModalX();
+        return true;
+      }
+      if (nowUrl && nowUrl.startsWith(ftTerminalNode + '-') && nowUrl !== bestSeen) {
+        bestSeen = nowUrl;
+        // Don't bail yet -- keep clicking up.
+      }
       const blocks = W.readBlocks();
       let target = null;
       for (const b of blocks) { if (b.actions.some(a => a.chosen)) target = b; }
-      if (!target) { logEntry('no_chosen_block', { safety, at: W.urlNode() }); return false; }
+      if (!target) {
+        // v9.13 (2026-05-25): enhanced diagnostics. Capture the actual DOM
+        // state at the moment of failure so we can root-cause why no
+        // chosen block is visible.
+        const candidates = document.querySelectorAll('div.bg-neutral-987-5');
+        const allBlocks = document.querySelectorAll('div.bg-neutral-987-5.cursor-pointer.rounded-md');
+        let panel_sample = '';
+        try { panel_sample = (document.body.innerText || '').slice(0, 200); } catch (_) {}
+        let blocks_class_sample = '';
+        if (allBlocks.length > 0) {
+          blocks_class_sample = (allBlocks[0].className || '').toString().slice(0, 120);
+        }
+        // Look for any element with a bg-call/raise/check class as proxy
+        // for "is there ANY chosen-highlight anywhere on the page"
+        const hasAnyChosenSomewhere = !!document.querySelector(
+          '[class*="bg-call-"], [class*="bg-raise-"], [class*="bg-check-"], ' +
+          '[class*="bg-fold-"], [class*="bg-allin-"], [class*="bg-bet-"], ' +
+          '[class*="bg-pot-"]'
+        );
+        // v9.14 (2026-05-26): chain-decomposition diagnostic. Decompose the
+        // terminal node into the action sequence (C-R50-R75-C ->
+        // [Check, 1/2 pot, 3/4 pot, Call]) and see if any visible block has
+        // the LAST chain entry's action available. If yes, future v9.16
+        // can use this as the primary stabilize selector instead of
+        // relying on the volatile bg-* highlight class.
+        function _decompTerminalToActions(node) {
+          if (!node) return [];
+          const segs = node.split('-');
+          const pctMap = { '20':'1/5 pot', '25':'1/4 pot', '33':'1/3 pot',
+                           '50':'1/2 pot', '66':'2/3 pot', '75':'3/4 pot',
+                           '100':'Pot' };
+          const out = [];
+          for (let i = 0; i < segs.length; i++) {
+            const s = segs[i];
+            let label;
+            if (s === 'C') {
+              const prev = out.length ? out[out.length - 1].label : null;
+              const wasRaise = prev && /pot|Pot|All/.test(prev);
+              label = wasRaise ? 'Call' : 'Check';
+            } else if (s === 'F') label = 'Fold';
+            else if (s === 'A') label = 'All in';
+            else if (s.startsWith('R')) label = pctMap[s.slice(1)] || (s.slice(1) + '% pot');
+            else label = s;
+            out.push({ segment: s, label });
+          }
+          return out;
+        }
+        const chain = _decompTerminalToActions(ftTerminalNode);
+        const terminalAction = chain.length ? chain[chain.length - 1].label : null;
+        let chain_candidate = null;
+        if (terminalAction) {
+          for (const b of blocks) {
+            const match = b.actions.find(a => a.label === terminalAction && !a.disabled);
+            if (match) {
+              chain_candidate = {
+                player: b.player,
+                stack: b.stack,
+                terminal_action_label: terminalAction,
+                action_disabled: match.disabled,
+                action_chosen_via_class: match.chosen,
+              };
+              break;
+            }
+          }
+        }
+        logEntry('no_chosen_block', {
+          safety, at: nowUrl,
+          modal_kind: W.modalKind ? W.modalKind() : null,
+          n_blocks_found: blocks.length,
+          n_div_neutral_987_5: candidates.length,
+          n_div_full_block_match: allBlocks.length,
+          has_any_chosen_anywhere: hasAnyChosenSomewhere,
+          blocks_class_sample: blocks_class_sample,
+          panel_sample: panel_sample,
+          best_seen: bestSeen,
+          chain_terminal_action: terminalAction,
+          chain_candidate: chain_candidate,
+        });
+        return false;
+      }
       const before = W.urlNode();
       target.headerEl.click();
       await sleep(2000);
@@ -2013,6 +2116,6 @@
     };
   }
 
-  return 'multi-street scraper installed (window.__scrapeMultiStreet, window.__scrapeSession) [v9.8 monotone-rule auto-alias (D/C aliased on monotone S/H boards); v9.11 producer-aware session_record (session_kind=producer for full-flop runs); v9.7.1 session-record-only emit, __msEmitResumeFile removed; v9.7 session-record-emit; tier 2/3 orch: categories-activate + partial-browse + shuffle_cards; tier-1 fixes: all-terminals-cached + per-card-manifest + modal-cleanup; phase 7 emergency-stop hook; phase 4 human-like noise wired (cfg.human_like -> window.__msHumanCfg + turn hover hook); phase 3 session wrapper; phase 2 card maps + target_cards_per_terminal; phase 1 session mode (zip_per_card + device_name + session_id); post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
+  return 'multi-street scraper installed (window.__scrapeMultiStreet, window.__scrapeSession) [v9.14 chain-decomp diagnostic in no_chosen_block; v9.13 stabilize-iter-modal-close + diagnostics + url-prefix-match; v9.8 monotone-rule auto-alias (D/C aliased on monotone S/H boards); v9.11 producer-aware session_record (session_kind=producer for full-flop runs); v9.7.1 session-record-only emit, __msEmitResumeFile removed; v9.7 session-record-emit; tier 2/3 orch: categories-activate + partial-browse + shuffle_cards; tier-1 fixes: all-terminals-cached + per-card-manifest + modal-cleanup; phase 7 emergency-stop hook; phase 4 human-like noise wired (cfg.human_like -> window.__msHumanCfg + turn hover hook); phase 3 session wrapper; phase 2 card maps + target_cards_per_terminal; phase 1 session mode (zip_per_card + device_name + session_id); post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
 })();
 

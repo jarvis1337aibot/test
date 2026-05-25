@@ -1,4 +1,4 @@
-/* scrape_ui_nav.js -- UI-driven scenario picker navigation (v9.10.4, 2026-05-25 (verifyDialogClosed + lenient flop matcher + URL fallback) (flop-only fast path) (Heads Up skip pos + rank-only flop match))
+/* scrape_ui_nav.js -- UI-driven scenario picker navigation (v9.13, 2026-05-25 (null-op path when URL already at target) (verifyDialogClosed + lenient flop matcher + URL fallback) (flop-only fast path) (Heads Up skip pos + rank-only flop match))
  *
  * Installs window.__navigateToFlopViaUI(spec) which clicks through the
  * trainer's "Select scenario" modal instead of relying on direct URL
@@ -544,14 +544,45 @@
     }
     stepsCompleted.push('host_ok');
 
-    // (A2) PATH DETECTION: if the URL already has the desired tree on the
-    //   postflop trainer, skip the scenario picker and use the fast
-    //   flop-only-change path. The trainer's FLOP action block opens the
-    //   "Select a flop" dialog directly. Saves ~15 seconds.
+    // (A2) PATH DETECTION:
+    //   - If URL ALREADY at target (tree+flop+postflop): NULL-OP (v9.13).
+    //     Saves ~10s per chunk when chunk N+1 is on the same flop as chunk N.
+    //   - Else if URL has correct tree+postflop but wrong flop: flop-only
+    //     fast path (v9.10.2). Click FLOP action block to open Select-a-flop
+    //     dialog directly, skip scenario picker. Saves ~15s.
+    //   - Else: full scenario picker.
     const u = new URL(location.href);
     const curTree = u.searchParams.get('tree');
+    const curFlop = u.searchParams.get('flop');
     const curType = u.searchParams.get('type');
+    const nullOpPath = (curTree === spec.tree && curFlop === spec.flop && curType === 'postflop');
     const fastPath = (curTree === spec.tree && curType === 'postflop');
+
+    if (nullOpPath) {
+      stepsCompleted.push('path_already_at_target');
+      // Verify no picker is currently open (could be a leftover from a prior
+      // interaction in the same chat). If one is open, force-close it before
+      // the walker tries to interact with the page.
+      const wasClosed = await verifyDialogClosed(opts, 2000);
+      if (!wasClosed) {
+        warnings.push('null-op path: a picker dialog was still open and could not be force-closed');
+      }
+      // Give the page a brief moment to settle (mostly cosmetic since URL
+      // already matches; the walker's own state is what matters next).
+      await sleep(500);
+      const final_url = new URL(location.href);
+      return {
+        ok: true,
+        steps_completed: stepsCompleted,
+        final_url: {
+          tree: final_url.searchParams.get('tree'),
+          flop: final_url.searchParams.get('flop'),
+          type: final_url.searchParams.get('type'),
+          match: true,
+        },
+        warnings: warnings.concat(['already at target URL; navigation skipped (null-op path)']),
+      };
+    }
 
     if (fastPath) {
       stepsCompleted.push('path_flop_only');
@@ -600,6 +631,6 @@
 
   window.__msUiNavInstalled = true;
   try {
-    console.log('[ui-nav v9.10.4] installed __navigateToFlopViaUI(spec)');
+    console.log('[ui-nav v9.13] installed __navigateToFlopViaUI(spec)');
   } catch (_) {}
 })();
