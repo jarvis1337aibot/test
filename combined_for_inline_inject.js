@@ -1,24 +1,21 @@
 /* combined_for_inline_inject.js -- hand-scraper-postflop-flop-turn
  *
- * v9.10 (2026-05-24): UI-driven scenario picker navigation.
- *   New window.__navigateToFlopViaUI(spec) walks the trainer's "Select
- *   scenario" modal -- filters Street->Postflop, Type->1vs1, Players->Heads
- *   Up, Stack Size, Scenario (SRP/3BP/4BP/SQ), Turns Available (Yes for
- *   SRP/3BP), First Position, Second Position -- then clicks the scenario
- *   list row and types the flop letter-by-letter into the flop-search popup.
- *   1-2s between clicks, 0.5-1s between letters (configurable).
+ * v9.10.1 (2026-05-25): UI-nav fixes from live testing.
+ *   (a) Heads Up implicitly hides First/Second Position rows in the picker —
+ *       helper now SKIPS those clicks when n_players === 2.
+ *   (b) Flop list rows render suits as visual icons (not text); flop match
+ *       now keys on the 3 ranks (positions 0,2,4 of the flop string) rather
+ *       than the literal "8s6s2s" string, which doesn't appear in textContent.
+ *   Also: flop-search input is located by proximity to the "Flop list" h6
+ *   header (the popup has multiple Search inputs).
  *
- * v9.9: walker 429 detection. fetch+XHR interceptors flag __msQuotaExceeded
- *   on HTTP 429 responses to any /range/url or execute-api endpoint so
- *   the orchestrator aborts cleanly with exit_reason='quota_exceeded'.
+ * v9.10: __navigateToFlopViaUI(spec) walks the trainer's "Select scenario"
+ *   modal click-by-click. Verified end-to-end on PLO5C_100_2_SB_BB_3BP / 8s6s2s.
  *
- * v9.8: monotone-board auto-alias rule. On monotone S or H flops, D and
- *   C non-board cards are excluded from workload assigned_cards at emit
- *   time (canonical = H on monotone S, S on monotone H).
- *
- * v9.7.1: __msEmitResumeFile + per-card resume.json files removed.
- * v9.7: __msBuildSessionRecord + __msEmitSessionRecord emit a single
- *   session_record.json at session end, matching ledger.py finalize-session.
+ * v9.9: walker 429 detection via fetch+XHR interceptors.
+ * v9.8: monotone-board auto-alias rule (D+C cards aliased on monotone S/H).
+ * v9.7.1: __msEmitResumeFile removed.
+ * v9.7: __msBuildSessionRecord + __msEmitSessionRecord.
  * v9.6: partialWalkOnTerminal uses pickCardCommit for suitmap auto-recovery.
  * v9.5: picker coalesces cfg.turn_cards_per_terminal as a fallback.
  */
@@ -4937,8 +4934,8 @@
   return { v17_extension_loaded: true };
 })();
 
-/* ==================== 7) UI NAV (v9.10) ==================== */
-/* scrape_ui_nav.js -- UI-driven scenario picker navigation (v9.10, 2026-05-24)
+/* ==================== 7) UI NAV (v9.10.1) ==================== */
+/* scrape_ui_nav.js -- UI-driven scenario picker navigation (v9.10.1, 2026-05-25 (Heads Up skip pos + rank-only flop match))
  *
  * Installs window.__navigateToFlopViaUI(spec) which clicks through the
  * trainer's "Select scenario" modal instead of relying on direct URL
@@ -5160,15 +5157,21 @@
       else await clickAndPace(turnsYes, opts);
     }
 
-    // (h) First Position
-    const pos1Btn = findOptionUnderLabel('First Position', filters.pos1);
-    if (!pos1Btn) throw new Error(`First Position "${filters.pos1}" not found`);
-    await clickAndPace(pos1Btn, opts);
-
-    // (i) Second Position
-    const pos2Btn = findOptionUnderLabel('Second Position', filters.pos2);
-    if (!pos2Btn) throw new Error(`Second Position "${filters.pos2}" not found`);
-    await clickAndPace(pos2Btn, opts);
+    // (h, i) First Position + Second Position.
+    //   IMPORTANT: For Heads Up (n_players === 2) the picker AUTO-HIDES these
+    //   filter rows since positions are implicit (SB vs BB). The scenario list
+    //   already narrows to one row from the other filters. Skipping these is
+    //   required — attempting to click them when they don't exist throws.
+    if (filters.n_players !== 2) {
+      const pos1Btn = findOptionUnderLabel('First Position', filters.pos1);
+      if (!pos1Btn) throw new Error(`First Position "${filters.pos1}" not found`);
+      await clickAndPace(pos1Btn, opts);
+      const pos2Btn = findOptionUnderLabel('Second Position', filters.pos2);
+      if (!pos2Btn) throw new Error(`Second Position "${filters.pos2}" not found`);
+      await clickAndPace(pos2Btn, opts);
+    } else {
+      warnings.push('Skipped First/Second Position clicks (Heads Up — picker auto-hides them)');
+    }
   }
 
   async function clickFirstScenarioRow(opts) {
@@ -5199,39 +5202,61 @@
   }
 
   async function typeFlopAndPick(flop, opts, warnings) {
-    // After scenario-row click, a SECOND dialog appears with a flop search input.
-    // Wait for an <input> to be present in a dialog (could be the same dialog
-    // re-rendered or a new one).
+    // After scenario-row click, a SECOND dialog appears with title "Select a
+    // flop". The flop list is on the right side, with a "Search" input above
+    // suit-icon rows. Suits render as VISUAL ICONS (not text), so the row's
+    // textContent contains just the 3 ranks (e.g. "862") plus question marks
+    // for the icon glyphs. We match by checking that all 3 ranks of the
+    // desired flop appear in the row's textContent, AND the row is below the
+    // search input AND aligned to its column.
     const flopInput = await waitFor(() => {
       const dialog = document.querySelector('dialog.modal-root');
       if (!dialog) return null;
-      const input = dialog.querySelector('input[type="text"], input:not([type])');
-      return input && input.offsetParent !== null ? input : null;
+      // The flop popup has multiple Search inputs (suit filters + flop list);
+      // pick the one nearest the "Flop list" h6 header.
+      const flopHeader = Array.from(dialog.querySelectorAll('h6'))
+        .find(h => (h.textContent || '').trim() === 'Flop list');
+      if (!flopHeader) return null;
+      const fhr = flopHeader.getBoundingClientRect();
+      const inputs = Array.from(dialog.querySelectorAll('input'))
+        .filter(i => i.offsetParent !== null && i.placeholder === 'Search');
+      if (!inputs.length) return null;
+      // The flop-list search input is just below the "Flop list" header
+      let best = null, bestDy = Infinity;
+      for (const i of inputs) {
+        const r = i.getBoundingClientRect();
+        const dy = Math.abs(r.top - fhr.bottom);
+        if (dy < bestDy) { bestDy = dy; best = i; }
+      }
+      return best;
     }, 8000);
     if (!flopInput) throw new Error('flop-search input did not appear');
     await sleep(randInt(opts.slow_ms_min, opts.slow_ms_max));
     await typeLetterByLetter(flopInput, flop, opts);
-    // Wait for matching option to appear and click it. The match is a row
-    // BELOW the input. There should be exactly one after typing the 6-char flop.
-    await sleep(800);  // let the list filter
+    // Wait for list to filter
+    await sleep(800);
+    // Extract ranks from the 6-char flop (positions 0, 2, 4)
+    const ranks = [flop[0], flop[2], flop[4]];
     const dialog = document.querySelector('dialog.modal-root');
     const ir = flopInput.getBoundingClientRect();
     let matchEl = null;
     dialog.querySelectorAll('div, button, li').forEach(el => {
-      if (el === flopInput) return;
       const r = el.getBoundingClientRect();
       if (r.top < ir.bottom + 4) return;
+      if (r.left < ir.left - 60 || r.left > ir.left + 400) return;
       if (r.width === 0 || r.height === 0) return;
       const cls = (el.className || '').toString();
-      // Only items that are clickable and look like a list row
       if (!/cursor-pointer/.test(cls)) return;
       const txt = (el.innerText || '').trim();
-      // Should contain the flop string verbatim
-      if (txt.toLowerCase().includes(flop.toLowerCase())) {
-        if (!matchEl || r.top < matchEl.getBoundingClientRect().top) matchEl = el;
-      }
+      if (!txt) return;
+      // Row must START with the first rank (e.g. "8") and contain all 3 ranks.
+      // The textContent for a 3-card flop is typically "<r1>\n<r2>\n<r3>\n?\n?".
+      if (!txt.startsWith(ranks[0])) return;
+      const seen = ranks.every(rk => txt.includes(rk));
+      if (!seen) return;
+      if (!matchEl || r.top < matchEl.getBoundingClientRect().top) matchEl = el;
     });
-    if (!matchEl) throw new Error(`no flop-search match for "${flop}"`);
+    if (!matchEl) throw new Error(`no flop-list row matches ranks of "${flop}" (suits are visual icons; matching by rank text)`);
     await clickAndPace(matchEl, opts);
   }
 
@@ -5305,6 +5330,6 @@
 
   window.__msUiNavInstalled = true;
   try {
-    console.log('[ui-nav v9.10] installed __navigateToFlopViaUI(spec)');
+    console.log('[ui-nav v9.10.1] installed __navigateToFlopViaUI(spec)');
   } catch (_) {}
 })();
