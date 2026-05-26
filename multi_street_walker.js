@@ -7,6 +7,12 @@
  *
  * Install order: this FIRST, then scrape_helpers.js, then scrape_multistreet.js.
  *
+ * v9.20 (2026-05-26): URL trace instrumentation. _msTraceLog() at every
+ *   code boundary point in walker + orchestrator. Pure observation, no
+ *   behavior change. Records state into window.__msProgress.url_trace
+ *   and persists into session_record. Goal: pinpoint exactly when URL
+ *   transitions from R66-R75-C-A to R66-R75 (or '') on All-in collapse.
+ *
  * v9.19 (2026-05-26): All-in anchor click (Option 1).
  *   - v9.18 Phase B + C reverted in scrape_multistreet.js (no real benefit;
  *     cost was identical to legacy v9.17 path).
@@ -576,6 +582,36 @@
     } catch (_) {}
   }
 
+
+  // v9.20 (2026-05-26): URL trace instrumentation. Records URL+modal+blocks
+  //   state at every code boundary point so we can pinpoint exactly when
+  //   URL transitions on All-in collapse. Pure observation, no behavior change.
+  //   Data written to window.__msProgress.url_trace = []; persisted into
+  //   session_record by __msBuildSessionRecord (v9.20).
+  function _msTraceLog(label) {
+    try {
+      const prog = window.__msProgress = window.__msProgress || {};
+      prog.url_trace = prog.url_trace || [];
+      const now = Date.now();
+      const prev_t = prog.url_trace.length ? prog.url_trace[prog.url_trace.length-1].t : now;
+      let n_blocks = -1;
+      try { n_blocks = readBlocks().length; } catch (_) {}
+      prog.url_trace.push({
+        t: now,
+        dt_ms: now - prev_t,
+        label,
+        urlNode: urlNode(),
+        urlTurn: urlTurn() || null,
+        urlRiver: urlRiver() || null,
+        urlSuitMap: urlSuitMap() || null,
+        modalKind: modalKind ? modalKind() : null,
+        n_blocks,
+      });
+      if (prog.url_trace.length > 500) prog.url_trace.shift();
+    } catch (_) {}
+  }
+  window.__msTraceLog = _msTraceLog;
+
   let _humanNodeCount = 0;
   let _humanNextCategoryAt = null;
   let _humanNextNodeBrowseAt = null;
@@ -863,6 +899,7 @@
   }
 
   async function dfsStreet(state, walkResult, opts = {}) {
+    _msTraceLog('dfsStreet_enter_' + state.street + '_node_' + (state.node || '(root)'));
     // v15: random 3-5s inter-node wait at the start of every node visit.
     // Configurable via window.__msNodeWaitMin / window.__msNodeWaitMax.
     await maybeHumanLikeNoiseBetweenNodes();
@@ -1004,6 +1041,7 @@
       const pickIsAllIn = _v18_isAllInPick(pick);
 
       let clickResult = await clickActionAndWait(pick.el, childPath);
+      _msTraceLog('post_clickAction_' + pick.label + '_expect_' + childPath);
       if (!clickResult.success) {
         walkResult.warnings.push(`click "${pick.label}" at ${state.node || '(root)'} timed out (got "${clickResult.after}" expected "${childPath}") - retrying`);
         await sleep(400);
@@ -1011,6 +1049,7 @@
         const retryEl = ab2?.actions.find(a => a.label === pick.label && !a.disabled)?.el;
         if (retryEl) {
           clickResult = await clickActionAndWait(retryEl, childPath);
+          _msTraceLog('post_clickAction_retry_' + pick.label);
         }
         if (!clickResult.success) {
           walkResult.warnings.push(`click "${pick.label}" at ${state.node || '(root)'} FAILED on retry — skipping (got "${clickResult.after}" expected "${childPath}")`);
@@ -1030,9 +1069,13 @@
       // capture for N-A is made by the click above, so range data for the
       // post-All-in spot is fully preserved.
       if (pickIsAllIn) {
+        _msTraceLog('allin_block_entry');
         await maybeHumanLikeNoiseBetweenNodes();
-    await interNodeWait();
+        _msTraceLog('post_allin_humanNoise');
+        await interNodeWait();
+        _msTraceLog('post_allin_interNodeWait');
         const abAllIn = await waitForActionPanelStable(4000, 500);
+        _msTraceLog('post_allin_waitForActionPanelStable_' + (abAllIn ? 'ok' : 'null'));
         if (!abAllIn || abAllIn.actions.length === 0) {
           walkResult.warnings.push(`all-in node ${childPath}: no stable action panel after click (capture may still be valid)`);
         } else {
@@ -1060,12 +1103,15 @@
             v18_all_in_no_descend: true,
           };
           walkResult.nodes.push(allInNodeRec);
+          _msTraceLog('post_allin_record');
           if (opts.onNodeRecorded) {
             try { await opts.onNodeRecorded(allInState, allInNodeRec); }
             catch (e) { walkResult.warnings.push(`onNodeRecorded all-in: ${e.message}`); }
+            _msTraceLog('post_allin_onNodeRecorded_cb');
           }
         }
 
+        _msTraceLog('pre_v919_anchor_check');
         // v9.19 ANCHOR CLICK (Option 1): race-prevent the trainer's
         //   post-terminal-action auto-collapse. After All-in, the
         //   trainer's UI tends to collapse the entire chain view back
@@ -1082,7 +1128,9 @@
               const blocksNow = readBlocks();
               const anchorBlock = blocksNow[ftbIdx];
               if (anchorBlock && anchorBlock.headerEl) {
+                _msTraceLog('pre_v919_anchor_click_player_' + (anchorBlock.player || '?'));
                 const anchorResult = await clickHeaderAndWait(anchorBlock.headerEl, state.node);
+                _msTraceLog('post_v919_anchor_click_' + (anchorResult.success ? 'ok' : 'mismatch') + '_after_' + anchorResult.after);
                 try {
                   window.__msProgress.stabilize_log = window.__msProgress.stabilize_log || [];
                   window.__msProgress.stabilize_log.push({
@@ -1134,6 +1182,7 @@
       // still walked by the parent's iteration continuing after this
       // depth returns.
       if (walkedLabels.size >= iterableTotal) {
+        _msTraceLog('chain_collapse_return_at_' + (state.node || '(root)'));
         return;
       }
 
@@ -1141,10 +1190,13 @@
       const blocksAfter = readBlocks();
       const myBlockNow = blocksAfter[myIndex];
       if (!myBlockNow) {
+        _msTraceLog('per_level_backout_oob_at_' + (state.node || '(root)'));
         walkResult.warnings.push(`back-out OOB at ${state.node || '(root)'}`);
         return;
       }
+      _msTraceLog('pre_per_level_backout_click_player_' + (myBlockNow.player || '?'));
       const headerResult = await clickHeaderAndWait(myBlockNow.headerEl, state.node);
+      _msTraceLog('post_per_level_backout_click_' + (headerResult.success ? 'ok' : 'mismatch') + '_after_' + headerResult.after);
       if (!headerResult.success || urlNode() !== state.node) {
         walkResult.warnings.push(`back-out wrong: exp="${state.node}" got="${urlNode()}"`);
         return;
