@@ -7,6 +7,10 @@
  *
  * Install order: this FIRST, then scrape_helpers.js, then scrape_multistreet.js.
  *
+ * v9.18 changes (walker): reopenChipModal snapshots __msFirstTurnBlockIndex;
+ *   clickActionAndWait tracks __msLastActionClicked. Both used by v9.18 Phase B+C
+ *   in scrape_multistreet.js for All-in collapse handling.
+ *
  * v18 changes from v15 (walker):
  *   - ALL-IN NO-DESCEND: when the DFS iteration loop picks an All-in action
  *     (code 'A'), the walker no longer recurses into a fresh dfsStreet for
@@ -722,9 +726,28 @@
     const t0 = Date.now();
     while (Date.now() - t0 < 5000 && modalKind() !== kind) await sleep(100);
     await sleep(200);
+    // v9.18 Phase B: snapshot first-turn-block index when the turn modal opens.
+    //   Modal is open over the action panel; visible blocks behind it are
+    //   flop-level only (any prior turn segment was collapsed by trainer to
+    //   show the modal). readBlocks().length is therefore the index where
+    //   the first turn-level block will appear once the modal closes after
+    //   a card is picked. Used by stabilizeBackToTerminal for index-based
+    //   back-nav (replaces "last chosen highlight" heuristic on success path).
+    if (kind === 'turn' && modalKind() === 'turn') {
+      try {
+        window.__msFirstTurnBlockIndex = readBlocks().length;
+      } catch (_) { /* defensive */ }
+    }
   }
 
   async function clickActionAndWait(actionEl, expectedNode = null, timeoutMs = 4000) {
+    // v9.18 Phase C: track last action clicked so reopenTurnModalCheapOrFull
+    // can detect All-in collapses post-walk.
+    try {
+      const label = (actionEl?.textContent || '').trim();
+      const code = codeForLabel(label);
+      window.__msLastActionClicked = { label, code, t: Date.now() };
+    } catch (_) { /* defensive */ }
     const before = urlNode();
     actionEl.click();
     const t0 = Date.now();
@@ -1225,5 +1248,5 @@
   window.__msInlineModalCaptureInstalled = true; // 2026-05-23 v7: inline turn-modal capture in flop DFS
   window.__msPostTier8WalkerInstalled = true; // 2026-05-24 v8: always-click Categories tab + real partial walk
   window.__msTier2NoiseInstalled = true;
-  return 'multi-street walker installed (window.__W) [tier 2 noise: categories-tab activate + partial-browse; phase 7 safety detect + emergency stop emit; phase 4 human-like noise (long pauses + hover bursts + category exploration); v18 all-in no-descend + back-out chain collapse; v15 random 3-5s inter-node wait; v13 plomm envelope support; v11 dynamic bet sizings + 1/5 pot static]';
+  return 'multi-street walker installed (window.__W) [v9.18 All-in collapse: firstTurnBlockIndex snapshot in reopenChipModal + lastActionClicked tracking in clickActionAndWait; tier 2 noise: categories-tab activate + partial-browse; phase 7 safety detect + emergency stop emit; phase 4 human-like noise (long pauses + hover bursts + category exploration); v18 all-in no-descend + back-out chain collapse; v15 random 3-5s inter-node wait; v13 plomm envelope support; v11 dynamic bet sizings + 1/5 pot static]';
 })();
