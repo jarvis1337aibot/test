@@ -198,37 +198,26 @@
     // deep terminals where the trainer auto-positions URL one segment past.
     let bestSeen = W.urlNode();
 
-    // v9.18 Phase B: PRIMARY path -- click first-turn-block by snapshot index.
-    //   Index was captured at reopenChipModal('turn') as readBlocks().length
-    //   while the modal was open (= flop block count). Clicking that block's
-    //   header backs URL up to flop terminal in one navigation. Mirrors v18
-    //   intra-DFS discipline ("know target by index, click confidently").
-    //   On All-in collapse the index is OOB (turn blocks not in DOM); log
-    //   and fall through to legacy heuristic loop. Zero regression for
-    //   non-collapse cases.
+    // v9.19 (2026-05-26): v9.18 Phase B PRIMARY CLICK REVERTED.
+    //   The active click attempt didn't help on All-in collapse cases (turn
+    //   blocks gone post-collapse, blocks[ftbIdx] was OOB) and fell through
+    //   to heuristic loop anyway. The logEntry observations are kept as pure
+    //   DIAGNOSTIC so we can SEE whether the index points at a valid block
+    //   at stabilize entry. Real All-in recovery is the anchor click in
+    //   walker.dfsStreet (v9.19 Option 1) that fires BEFORE stabilize.
     const ftbIdx = window.__msFirstTurnBlockIndex;
     if (typeof ftbIdx === 'number' && ftbIdx >= 0) {
       const blocks0 = W.readBlocks();
       const firstTurnBlock = blocks0[ftbIdx];
       if (firstTurnBlock && firstTurnBlock.headerEl) {
-        logEntry('attempt_first_turn_block', {
-          ftbIdx, at: W.urlNode(), blocks_n: blocks0.length
-        });
-        const before0 = W.urlNode();
-        firstTurnBlock.headerEl.click();
-        await sleep(900);
-        if (W.urlNode() === ftTerminalNode) {
-          logEntry('first_turn_block_success', { ftbIdx, urlNode: W.urlNode() });
-          if (W.modalKind()) await W.closeModalX();
-          return true;
-        }
-        logEntry('first_turn_block_partial', {
-          ftbIdx, before: before0, after: W.urlNode()
+        logEntry('first_turn_block_visible', {
+          ftbIdx, at: W.urlNode(), blocks_n: blocks0.length,
+          note: 'walker anchor click should have already run; if stabilize is needed, something else collapsed the view',
         });
       } else {
         logEntry('first_turn_block_oob_or_collapsed', {
           ftbIdx, blocks_n: blocks0.length, at: W.urlNode(),
-          modal: W.modalKind(), urlTurn: W.urlTurn()
+          modal: W.modalKind(), urlTurn: W.urlTurn(),
         });
       }
     }
@@ -385,10 +374,11 @@
       } catch (e) { /* fall through */ }
     }
 
-    // v9.18 Phase C: All-in collapse fast recovery. FIRES ONLY when ALL
-    //   four hard gates pass; any miss = fall through to existing
-    //   replay-from-root path (byte-for-byte same behavior as v9.17).
-    //   Saves ~5 /range/url per card vs full replay.
+    // v9.19 (2026-05-26): v9.18 Phase C "fast path" REVERTED.
+    //   The recovery code was BYTE-IDENTICAL to the legacy replay path
+    //   (same replayFromFlopRoot + openModalByCloser, same /range/url cost).
+    //   KEPT: detection logEntry to count remaining All-in collapses (i.e.,
+    //   cases where the v9.19 walker-side anchor click did not prevent it).
     try {
       const lastClick = window.__msLastActionClicked;
       const wasAllIn = lastClick && lastClick.code === 'A';
@@ -399,29 +389,16 @@
         try {
           window.__msProgress.stabilize_log = window.__msProgress.stabilize_log || [];
           window.__msProgress.stabilize_log.push({
-            t: Date.now(), kind: 'allin_collapse_fast_path_attempt',
-            target: ft.terminal_node, last_label: lastClick.label
+            t: Date.now(),
+            kind: 'allin_collapse_detected',
+            target: ft.terminal_node,
+            last_label: lastClick.label,
+            note: 'walker anchor click did not prevent trainer collapse; falling through to legacy replay',
           });
-        } catch (_) {}
-        if (await replayFromFlopRoot(ft.parent, walkResult) && W.urlNode() === ft.parent) {
-          if (await openModalByCloser(ft.via)) {
-            try {
-              window.__msProgress.stabilize_log.push({
-                t: Date.now(), kind: 'allin_collapse_fast_path_success',
-                target: ft.terminal_node
-              });
-            } catch (_) {}
-            return { ok: true, path: 'allin-fast' };
-          }
-        }
-        try {
-          window.__msProgress.stabilize_log.push({
-            t: Date.now(), kind: 'allin_collapse_fast_path_failed',
-            target: ft.terminal_node, urlNode: W.urlNode()
-          });
+          if (window.__msProgress.stabilize_log.length > 200) window.__msProgress.stabilize_log.shift();
         } catch (_) {}
       }
-    } catch (_) { /* defensive: never block legacy fallback */ }
+    } catch (_) { /* defensive */ }
 
     if (!await replayFromFlopRoot(ft.parent, walkResult)) return { ok: false, path: 'replay-failed' };
     if (!await openModalByCloser(ft.via)) return { ok: false, path: 'closer-failed' };
@@ -2208,6 +2185,6 @@
     };
   }
 
-  return 'multi-street scraper installed (window.__scrapeMultiStreet, window.__scrapeSession) [v9.18 All-in collapse: firstTurnBlockIndex primary + All-in fast path; v9.17 true-quota-counter (n_range_url_calls per session); v9.14 chain-decomp diagnostic in no_chosen_block; v9.13 stabilize-iter-modal-close + diagnostics + url-prefix-match; v9.8 monotone-rule auto-alias (D/C aliased on monotone S/H boards); v9.11 producer-aware session_record (session_kind=producer for full-flop runs); v9.7.1 session-record-only emit, __msEmitResumeFile removed; v9.7 session-record-emit; tier 2/3 orch: categories-activate + partial-browse + shuffle_cards; tier-1 fixes: all-terminals-cached + per-card-manifest + modal-cleanup; phase 7 emergency-stop hook; phase 4 human-like noise wired (cfg.human_like -> window.__msHumanCfg + turn hover hook); phase 3 session wrapper; phase 2 card maps + target_cards_per_terminal; phase 1 session mode (zip_per_card + device_name + session_id); post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
+  return 'multi-street scraper installed (window.__scrapeMultiStreet, window.__scrapeSession) [v9.19 All-in anchor click (walker-side, Option 1); v9.18 reverted (Phase B+C — no cost savings); v9.18 diagnostics kept: v9.17 true-quota-counter (n_range_url_calls per session); v9.14 chain-decomp diagnostic in no_chosen_block; v9.13 stabilize-iter-modal-close + diagnostics + url-prefix-match; v9.8 monotone-rule auto-alias (D/C aliased on monotone S/H boards); v9.11 producer-aware session_record (session_kind=producer for full-flop runs); v9.7.1 session-record-only emit, __msEmitResumeFile removed; v9.7 session-record-emit; tier 2/3 orch: categories-activate + partial-browse + shuffle_cards; tier-1 fixes: all-terminals-cached + per-card-manifest + modal-cleanup; phase 7 emergency-stop hook; phase 4 human-like noise wired (cfg.human_like -> window.__msHumanCfg + turn hover hook); phase 3 session wrapper; phase 2 card maps + target_cards_per_terminal; phase 1 session mode (zip_per_card + device_name + session_id); post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
 })();
 

@@ -7,6 +7,19 @@
  *
  * Install order: this FIRST, then scrape_helpers.js, then scrape_multistreet.js.
  *
+ * v9.19 (2026-05-26): All-in anchor click (Option 1).
+ *   - v9.18 Phase B + C reverted in scrape_multistreet.js (no real benefit;
+ *     cost was identical to legacy v9.17 path).
+ *   - NEW: dfsStreet now clicks the first-turn-block header IMMEDIATELY after
+ *     All-in record (when state.street === 'turn'), to anchor URL at the
+ *     flop terminal node BEFORE the trainer auto-collapses the chain view.
+ *   - KEPT from v9.18 (diagnostics):
+ *     * reopenChipModal snapshots __msFirstTurnBlockIndex (NOW USED by anchor).
+ *     * clickActionAndWait tracks __msLastActionClicked (diagnostic).
+ *   - New stabilize_log kinds: allin_anchor_click_success,
+ *     allin_anchor_click_url_mismatch, allin_anchor_block_oob,
+ *     allin_anchor_no_ftb_idx.
+ *
  * v9.18 changes (walker): reopenChipModal snapshots __msFirstTurnBlockIndex;
  *   clickActionAndWait tracks __msLastActionClicked. Both used by v9.18 Phase B+C
  *   in scrape_multistreet.js for All-in collapse handling.
@@ -1052,6 +1065,60 @@
             catch (e) { walkResult.warnings.push(`onNodeRecorded all-in: ${e.message}`); }
           }
         }
+
+        // v9.19 ANCHOR CLICK (Option 1): race-prevent the trainer's
+        //   post-terminal-action auto-collapse. After All-in, the
+        //   trainer's UI tends to collapse the entire chain view back
+        //   to flop-tree-root within ~5-10s (observed 2026-05-26 session 6).
+        //   By clicking the first turn-level block's header IMMEDIATELY
+        //   after the All-in record, we navigate URL to state.node (the
+        //   turn-just-dealt state at the flop terminal). This anchors
+        //   the URL to a valid state and gives the trainer no reason
+        //   to collapse further. Fires only on turn All-ins.
+        if (state.street === 'turn') {
+          try {
+            const ftbIdx = window.__msFirstTurnBlockIndex;
+            if (typeof ftbIdx === 'number' && ftbIdx >= 0) {
+              const blocksNow = readBlocks();
+              const anchorBlock = blocksNow[ftbIdx];
+              if (anchorBlock && anchorBlock.headerEl) {
+                const anchorResult = await clickHeaderAndWait(anchorBlock.headerEl, state.node);
+                try {
+                  window.__msProgress.stabilize_log = window.__msProgress.stabilize_log || [];
+                  window.__msProgress.stabilize_log.push({
+                    t: Date.now(),
+                    kind: anchorResult.success ? 'allin_anchor_click_success' : 'allin_anchor_click_url_mismatch',
+                    target: state.node,
+                    after: anchorResult.after,
+                    ftbIdx,
+                    blocks_n: blocksNow.length,
+                  });
+                  if (window.__msProgress.stabilize_log.length > 200) window.__msProgress.stabilize_log.shift();
+                } catch (_) {}
+              } else {
+                try {
+                  window.__msProgress.stabilize_log = window.__msProgress.stabilize_log || [];
+                  window.__msProgress.stabilize_log.push({
+                    t: Date.now(),
+                    kind: 'allin_anchor_block_oob',
+                    ftbIdx,
+                    blocks_n: blocksNow.length,
+                  });
+                  if (window.__msProgress.stabilize_log.length > 200) window.__msProgress.stabilize_log.shift();
+                } catch (_) {}
+              }
+            } else {
+              try {
+                window.__msProgress.stabilize_log = window.__msProgress.stabilize_log || [];
+                window.__msProgress.stabilize_log.push({
+                  t: Date.now(),
+                  kind: 'allin_anchor_no_ftb_idx',
+                });
+                if (window.__msProgress.stabilize_log.length > 200) window.__msProgress.stabilize_log.shift();
+              } catch (_) {}
+            }
+          } catch (e) { /* defensive: never break the all-in path */ }
+        }
       } else {
         await dfsStreet({ ...state, node: childPath }, walkResult, opts);
       }
@@ -1248,5 +1315,5 @@
   window.__msInlineModalCaptureInstalled = true; // 2026-05-23 v7: inline turn-modal capture in flop DFS
   window.__msPostTier8WalkerInstalled = true; // 2026-05-24 v8: always-click Categories tab + real partial walk
   window.__msTier2NoiseInstalled = true;
-  return 'multi-street walker installed (window.__W) [v9.18 All-in collapse: firstTurnBlockIndex snapshot in reopenChipModal + lastActionClicked tracking in clickActionAndWait; tier 2 noise: categories-tab activate + partial-browse; phase 7 safety detect + emergency stop emit; phase 4 human-like noise (long pauses + hover bursts + category exploration); v18 all-in no-descend + back-out chain collapse; v15 random 3-5s inter-node wait; v13 plomm envelope support; v11 dynamic bet sizings + 1/5 pot static]';
+  return 'multi-street walker installed (window.__W) [v9.19 All-in anchor click (Option 1) — race-prevents trainer auto-collapse; v9.18 reverted (Phase B+C); v9.18 diagnostics kept: tier 2 noise: categories-tab activate + partial-browse; phase 7 safety detect + emergency stop emit; phase 4 human-like noise (long pauses + hover bursts + category exploration); v18 all-in no-descend + back-out chain collapse; v15 random 3-5s inter-node wait; v13 plomm envelope support; v11 dynamic bet sizings + 1/5 pot static]';
 })();
