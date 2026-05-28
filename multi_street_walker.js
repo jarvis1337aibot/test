@@ -7,29 +7,6 @@
  *
  * Install order: this FIRST, then scrape_helpers.js, then scrape_multistreet.js.
  *
- * v9.20 (2026-05-26): URL trace instrumentation. _msTraceLog() at every
- *   code boundary point in walker + orchestrator. Pure observation, no
- *   behavior change. Records state into window.__msProgress.url_trace
- *   and persists into session_record. Goal: pinpoint exactly when URL
- *   transitions from R66-R75-C-A to R66-R75 (or '') on All-in collapse.
- *
- * v9.19 (2026-05-26): All-in anchor click (Option 1).
- *   - v9.18 Phase B + C reverted in scrape_multistreet.js (no real benefit;
- *     cost was identical to legacy v9.17 path).
- *   - NEW: dfsStreet now clicks the first-turn-block header IMMEDIATELY after
- *     All-in record (when state.street === 'turn'), to anchor URL at the
- *     flop terminal node BEFORE the trainer auto-collapses the chain view.
- *   - KEPT from v9.18 (diagnostics):
- *     * reopenChipModal snapshots __msFirstTurnBlockIndex (NOW USED by anchor).
- *     * clickActionAndWait tracks __msLastActionClicked (diagnostic).
- *   - New stabilize_log kinds: allin_anchor_click_success,
- *     allin_anchor_click_url_mismatch, allin_anchor_block_oob,
- *     allin_anchor_no_ftb_idx.
- *
- * v9.18 changes (walker): reopenChipModal snapshots __msFirstTurnBlockIndex;
- *   clickActionAndWait tracks __msLastActionClicked. Both used by v9.18 Phase B+C
- *   in scrape_multistreet.js for All-in collapse handling.
- *
  * v18 changes from v15 (walker):
  *   - ALL-IN NO-DESCEND: when the DFS iteration loop picks an All-in action
  *     (code 'A'), the walker no longer recurses into a fresh dfsStreet for
@@ -334,22 +311,77 @@
   //   Old `pretendPartialBrowse` (hover-only) is kept as a thin alias for
   //   back-compat with any caller that hasn't migrated.
   async function partialWalkOnTerminal(currentTerminal, opts) {
-    // POST-TIER-9 FIX v9.3 (2026-05-24): fires BEFORE every target card walk.
-    //   - Walks 1-2 real action blocks forward (was 1-3).
-    //   - EDGE CASE: if all remaining non-fold non-allin actions are
-    //     street-closers (Call/Check that end the street), stop the action
-    //     walk early -- the line is over, no more advances inside this street.
+    // v9.26 (2026-05-28): ledger-driven candidate pool.
+    //   - opts.eligibility[currentTerminal] supplies {candidate_pool, auto_aliased, dim_dom}
+    //     from the workload JSON (card_map.available/auto_aliased_cards/card_map.dim_dom).
+    //     candidate_pool is already pre-filtered at workload-emit time; auto_aliased and
+    //     dim_dom ride along as belt-and-suspenders insurance.
+    //   - opts.excludeCards still names the FULL set of full-run cards this session
+    //     (every assigned card, walked or not) so we never collide with a real walk.
+    //   - window.__msPartialWalkedThisSession is a soft-exclude set: cards already
+    //     partial-walked in this session. Prevents re-picking the 1st partial's card
+    //     in the 2nd partial (stealth 1-2x sequence). Empty pool relaxes this only.
+    //   - nActions now reads partial_walk_actions_range from human_like cfg (default 1-2).
+    //   - If opts.eligibility is missing (legacy caller / older orchestrator), falls
+    //     back to the v9.25 status === 'ok' filter so it doesn't crash.
+    //   - EDGE CASE: if all remaining non-fold non-allin actions are street-closers,
+    //     stop the action walk early -- the line is over.
     //   - Always finishes with a category click + 10-20s settle wait.
     //   Quota: 1 card commit + 1-2 actions = 2-3 /range/url calls per partial walk.
     opts = opts || {};
     try {
       if (modalKind() !== 'turn') return 0;
+
+      // v9.26: build candidate pool from ledger eligibility, with legacy fallback.
+      const elig = (opts.eligibility || {})[currentTerminal] || null;
+      const hardExclude = new Set([
+        ...((opts.excludeCards || [])),               // full-run cards this session
+        ...((elig && elig.auto_aliased) || []),       // workload's auto_aliased_cards
+        ...((elig && elig.dim_dom)      || []),       // workload's card_map.dim_dom
+      ]);
+      window.__msPartialWalkedThisSession =
+        window.__msPartialWalkedThisSession || new Set();
+      const softExclude = window.__msPartialWalkedThisSession;
+
+      let candidateCards;
+      if (elig && Array.isArray(elig.candidate_pool) && elig.candidate_pool.length) {
+        // Ledger-driven path (v9.26+): trust workload.card_map.available.
+        candidateCards = elig.candidate_pool.slice();
+      } else {
+        // Legacy fallback (pre-v9.26 caller): infer from live DOM status.
+        const cells = readModalCells('turn');
+        if (!cells.length) return 0;
+        candidateCards = cells.filter(c => c.status === 'ok').map(c => c.card);
+      }
+
+      let poolCards = candidateCards.filter(c => !hardExclude.has(c) && !softExclude.has(c));
+      let usedFallback = false;
+      if (!poolCards.length) {
+        // Relax soft-exclude (allow re-walk of an earlier partial this session).
+        // Hard-exclude is NEVER relaxed.
+        poolCards = candidateCards.filter(c => !hardExclude.has(c));
+        usedFallback = true;
+      }
+      if (!poolCards.length) {
+        window.__msLastPartialWalkSkipReason = 'pool_exhausted';
+        return 0;
+      }
+
+      // We still need the modal cell for the visual hover + click element. Re-read.
       const cells = readModalCells('turn');
-      if (!cells.length) return 0;
-      const exclude = new Set(opts.excludeCards || []);
-      const pool = cells.filter(c => c.status === 'ok' && !exclude.has(c.card));
-      if (!pool.length) return 0;
-      const pick = pool[Math.floor(Math.random() * pool.length)];
+      const cellByCard = new Map(cells.map(c => [c.card, c]));
+      const pickCard = poolCards[Math.floor(Math.random() * poolCards.length)];
+      const pick = cellByCard.get(pickCard);
+      if (!pick || !pick.el || pick.status !== 'ok') {
+        // Card is in the workload's pool but not currently 'ok' in the live modal
+        // (e.g. modal not fully rendered, trainer marked it walked). Skip cleanly.
+        window.__msLastPartialWalkSkipReason = 'modal_cell_not_ok:' + pickCard;
+        return 0;
+      }
+      if (usedFallback) {
+        window.__msPartialWalkFallbackUsed =
+          (window.__msPartialWalkFallbackUsed || 0) + 1;
+      }
       try {
         pick.el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
         pick.el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }));
@@ -380,8 +412,10 @@
           (window.__msPartialWalkAliasRecoveries || 0) + 1;
       }
       await sleep(2000 + Math.floor(Math.random() * 2000));
-      // Walk 1-2 real action blocks forward (with end-of-line edge case)
-      const nActions = 1 + Math.floor(Math.random() * 2); // 1-2
+      // v9.26: action-walk count now profile-driven via partial_walk_actions_range.
+      // Default [1, 2] = current behavior.
+      const [_paLo, _paHi] = _hRange('partial_walk_actions_range', 1, 2);
+      const nActions = _hPickInt(_paLo, _paHi);
       let actionsWalked = 0;
       const fakeTurnState = { street: 'turn' };
       let endOfLine = false;
@@ -425,6 +459,9 @@
       window.__msLastPartialWalkTerminal = currentTerminal;
       window.__msLastPartialWalkActions = actionsWalked;
       window.__msLastPartialWalkEndOfLine = endOfLine;
+      // v9.26: record committed card in the session-local soft-exclude set so a
+      // subsequent partial within the same card-gate (stealth 1-2x) doesn't re-pick it.
+      try { window.__msPartialWalkedThisSession.add(partialCardWalked); } catch (_) {}
       return 1;
     } catch (e) {
       return 0;
@@ -468,15 +505,18 @@
       picks.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
     }
     if (!picks.length) return 0;
-    // Click each with 1-3s gap. No collapse afterward.
+    // Click each with profile-driven gap (default 1-3s). No collapse afterward.
+    // v9.26: gap and settle now read from category_gap_ms_range / category_settle_ms_range.
+    const [_cgLo, _cgHi] = _hRange('category_gap_ms_range', 1000, 3000);
     for (let i = 0; i < picks.length; i++) {
       try { picks[i].click(); } catch (_) {}
       if (i < picks.length - 1) {
-        await sleep(_rint(1000, 3000));
+        await sleep(_rint(_cgLo, _cgHi));
       }
     }
-    // Final settle wait: 5-15s after the last click.
-    await sleep(_rint(5000, 15000));
+    // Final settle wait: profile-driven (default 5-15s after the last click).
+    const [_csLo, _csHi] = _hRange('category_settle_ms_range', 5000, 15000);
+    await sleep(_rint(_csLo, _csHi));
     // Stats
     window.__msHumanStats = window.__msHumanStats || { node_hovers: 0, category_bursts: 0, turn_hovers: 0, partial_browses: 0 };
     window.__msHumanStats.category_bursts = (window.__msHumanStats.category_bursts || 0) + 1;
@@ -581,36 +621,6 @@
       console.warn('[hand-scraper phase7] EMERGENCY STOP emitted:', detail);
     } catch (_) {}
   }
-
-
-  // v9.20 (2026-05-26): URL trace instrumentation. Records URL+modal+blocks
-  //   state at every code boundary point so we can pinpoint exactly when
-  //   URL transitions on All-in collapse. Pure observation, no behavior change.
-  //   Data written to window.__msProgress.url_trace = []; persisted into
-  //   session_record by __msBuildSessionRecord (v9.20).
-  function _msTraceLog(label) {
-    try {
-      const prog = window.__msProgress = window.__msProgress || {};
-      prog.url_trace = prog.url_trace || [];
-      const now = Date.now();
-      const prev_t = prog.url_trace.length ? prog.url_trace[prog.url_trace.length-1].t : now;
-      let n_blocks = -1;
-      try { n_blocks = readBlocks().length; } catch (_) {}
-      prog.url_trace.push({
-        t: now,
-        dt_ms: now - prev_t,
-        label,
-        urlNode: urlNode(),
-        urlTurn: urlTurn() || null,
-        urlRiver: urlRiver() || null,
-        urlSuitMap: urlSuitMap() || null,
-        modalKind: modalKind ? modalKind() : null,
-        n_blocks,
-      });
-      if (prog.url_trace.length > 500) prog.url_trace.shift();
-    } catch (_) {}
-  }
-  window.__msTraceLog = _msTraceLog;
 
   let _humanNodeCount = 0;
   let _humanNextCategoryAt = null;
@@ -775,28 +785,9 @@
     const t0 = Date.now();
     while (Date.now() - t0 < 5000 && modalKind() !== kind) await sleep(100);
     await sleep(200);
-    // v9.18 Phase B: snapshot first-turn-block index when the turn modal opens.
-    //   Modal is open over the action panel; visible blocks behind it are
-    //   flop-level only (any prior turn segment was collapsed by trainer to
-    //   show the modal). readBlocks().length is therefore the index where
-    //   the first turn-level block will appear once the modal closes after
-    //   a card is picked. Used by stabilizeBackToTerminal for index-based
-    //   back-nav (replaces "last chosen highlight" heuristic on success path).
-    if (kind === 'turn' && modalKind() === 'turn') {
-      try {
-        window.__msFirstTurnBlockIndex = readBlocks().length;
-      } catch (_) { /* defensive */ }
-    }
   }
 
   async function clickActionAndWait(actionEl, expectedNode = null, timeoutMs = 4000) {
-    // v9.18 Phase C: track last action clicked so reopenTurnModalCheapOrFull
-    // can detect All-in collapses post-walk.
-    try {
-      const label = (actionEl?.textContent || '').trim();
-      const code = codeForLabel(label);
-      window.__msLastActionClicked = { label, code, t: Date.now() };
-    } catch (_) { /* defensive */ }
     const before = urlNode();
     actionEl.click();
     const t0 = Date.now();
@@ -899,7 +890,6 @@
   }
 
   async function dfsStreet(state, walkResult, opts = {}) {
-    _msTraceLog('dfsStreet_enter_' + state.street + '_node_' + (state.node || '(root)'));
     // v15: random 3-5s inter-node wait at the start of every node visit.
     // Configurable via window.__msNodeWaitMin / window.__msNodeWaitMax.
     await maybeHumanLikeNoiseBetweenNodes();
@@ -1041,7 +1031,6 @@
       const pickIsAllIn = _v18_isAllInPick(pick);
 
       let clickResult = await clickActionAndWait(pick.el, childPath);
-      _msTraceLog('post_clickAction_' + pick.label + '_expect_' + childPath);
       if (!clickResult.success) {
         walkResult.warnings.push(`click "${pick.label}" at ${state.node || '(root)'} timed out (got "${clickResult.after}" expected "${childPath}") - retrying`);
         await sleep(400);
@@ -1049,7 +1038,6 @@
         const retryEl = ab2?.actions.find(a => a.label === pick.label && !a.disabled)?.el;
         if (retryEl) {
           clickResult = await clickActionAndWait(retryEl, childPath);
-          _msTraceLog('post_clickAction_retry_' + pick.label);
         }
         if (!clickResult.success) {
           walkResult.warnings.push(`click "${pick.label}" at ${state.node || '(root)'} FAILED on retry — skipping (got "${clickResult.after}" expected "${childPath}")`);
@@ -1069,13 +1057,9 @@
       // capture for N-A is made by the click above, so range data for the
       // post-All-in spot is fully preserved.
       if (pickIsAllIn) {
-        _msTraceLog('allin_block_entry');
         await maybeHumanLikeNoiseBetweenNodes();
-        _msTraceLog('post_allin_humanNoise');
-        await interNodeWait();
-        _msTraceLog('post_allin_interNodeWait');
+    await interNodeWait();
         const abAllIn = await waitForActionPanelStable(4000, 500);
-        _msTraceLog('post_allin_waitForActionPanelStable_' + (abAllIn ? 'ok' : 'null'));
         if (!abAllIn || abAllIn.actions.length === 0) {
           walkResult.warnings.push(`all-in node ${childPath}: no stable action panel after click (capture may still be valid)`);
         } else {
@@ -1103,69 +1087,10 @@
             v18_all_in_no_descend: true,
           };
           walkResult.nodes.push(allInNodeRec);
-          _msTraceLog('post_allin_record');
           if (opts.onNodeRecorded) {
             try { await opts.onNodeRecorded(allInState, allInNodeRec); }
             catch (e) { walkResult.warnings.push(`onNodeRecorded all-in: ${e.message}`); }
-            _msTraceLog('post_allin_onNodeRecorded_cb');
           }
-        }
-
-        _msTraceLog('pre_v919_anchor_check');
-        // v9.19 ANCHOR CLICK (Option 1): race-prevent the trainer's
-        //   post-terminal-action auto-collapse. After All-in, the
-        //   trainer's UI tends to collapse the entire chain view back
-        //   to flop-tree-root within ~5-10s (observed 2026-05-26 session 6).
-        //   By clicking the first turn-level block's header IMMEDIATELY
-        //   after the All-in record, we navigate URL to state.node (the
-        //   turn-just-dealt state at the flop terminal). This anchors
-        //   the URL to a valid state and gives the trainer no reason
-        //   to collapse further. Fires only on turn All-ins.
-        if (state.street === 'turn') {
-          try {
-            const ftbIdx = window.__msFirstTurnBlockIndex;
-            if (typeof ftbIdx === 'number' && ftbIdx >= 0) {
-              const blocksNow = readBlocks();
-              const anchorBlock = blocksNow[ftbIdx];
-              if (anchorBlock && anchorBlock.headerEl) {
-                _msTraceLog('pre_v919_anchor_click_player_' + (anchorBlock.player || '?'));
-                const anchorResult = await clickHeaderAndWait(anchorBlock.headerEl, state.node);
-                _msTraceLog('post_v919_anchor_click_' + (anchorResult.success ? 'ok' : 'mismatch') + '_after_' + anchorResult.after);
-                try {
-                  window.__msProgress.stabilize_log = window.__msProgress.stabilize_log || [];
-                  window.__msProgress.stabilize_log.push({
-                    t: Date.now(),
-                    kind: anchorResult.success ? 'allin_anchor_click_success' : 'allin_anchor_click_url_mismatch',
-                    target: state.node,
-                    after: anchorResult.after,
-                    ftbIdx,
-                    blocks_n: blocksNow.length,
-                  });
-                  if (window.__msProgress.stabilize_log.length > 200) window.__msProgress.stabilize_log.shift();
-                } catch (_) {}
-              } else {
-                try {
-                  window.__msProgress.stabilize_log = window.__msProgress.stabilize_log || [];
-                  window.__msProgress.stabilize_log.push({
-                    t: Date.now(),
-                    kind: 'allin_anchor_block_oob',
-                    ftbIdx,
-                    blocks_n: blocksNow.length,
-                  });
-                  if (window.__msProgress.stabilize_log.length > 200) window.__msProgress.stabilize_log.shift();
-                } catch (_) {}
-              }
-            } else {
-              try {
-                window.__msProgress.stabilize_log = window.__msProgress.stabilize_log || [];
-                window.__msProgress.stabilize_log.push({
-                  t: Date.now(),
-                  kind: 'allin_anchor_no_ftb_idx',
-                });
-                if (window.__msProgress.stabilize_log.length > 200) window.__msProgress.stabilize_log.shift();
-              } catch (_) {}
-            }
-          } catch (e) { /* defensive: never break the all-in path */ }
         }
       } else {
         await dfsStreet({ ...state, node: childPath }, walkResult, opts);
@@ -1182,7 +1107,6 @@
       // still walked by the parent's iteration continuing after this
       // depth returns.
       if (walkedLabels.size >= iterableTotal) {
-        _msTraceLog('chain_collapse_return_at_' + (state.node || '(root)'));
         return;
       }
 
@@ -1190,13 +1114,10 @@
       const blocksAfter = readBlocks();
       const myBlockNow = blocksAfter[myIndex];
       if (!myBlockNow) {
-        _msTraceLog('per_level_backout_oob_at_' + (state.node || '(root)'));
         walkResult.warnings.push(`back-out OOB at ${state.node || '(root)'}`);
         return;
       }
-      _msTraceLog('pre_per_level_backout_click_player_' + (myBlockNow.player || '?'));
       const headerResult = await clickHeaderAndWait(myBlockNow.headerEl, state.node);
-      _msTraceLog('post_per_level_backout_click_' + (headerResult.success ? 'ok' : 'mismatch') + '_after_' + headerResult.after);
       if (!headerResult.success || urlNode() !== state.node) {
         walkResult.warnings.push(`back-out wrong: exp="${state.node}" got="${urlNode()}"`);
         return;
@@ -1367,5 +1288,6 @@
   window.__msInlineModalCaptureInstalled = true; // 2026-05-23 v7: inline turn-modal capture in flop DFS
   window.__msPostTier8WalkerInstalled = true; // 2026-05-24 v8: always-click Categories tab + real partial walk
   window.__msTier2NoiseInstalled = true;
-  return 'multi-street walker installed (window.__W) [v9.19 All-in anchor click (Option 1) — race-prevents trainer auto-collapse; v9.18 reverted (Phase B+C); v9.18 diagnostics kept: tier 2 noise: categories-tab activate + partial-browse; phase 7 safety detect + emergency stop emit; phase 4 human-like noise (long pauses + hover bursts + category exploration); v18 all-in no-descend + back-out chain collapse; v15 random 3-5s inter-node wait; v13 plomm envelope support; v11 dynamic bet sizings + 1/5 pot static]';
+  window.__msV926WalkerInstalled = true; // 2026-05-28 v9.26: ledger-driven partial-walk pool + hoisted category timing + partial_walk_actions_range
+  return 'multi-street walker installed (window.__W) v9.26 [v9.26: ledger-driven partial-walk pool (cfg.partial_walk_eligibility_per_terminal) + partial_walks_per_card_range + partial_walk_actions_range + category_settle_ms_range + category_gap_ms_range; tier 2 noise: categories-tab activate + partial-browse; phase 7 safety detect + emergency stop emit; phase 4 human-like noise (long pauses + hover bursts + category exploration); v18 all-in no-descend + back-out chain collapse; v15 random 3-5s inter-node wait; v13 plomm envelope support; v11 dynamic bet sizings + 1/5 pot static]';
 })();

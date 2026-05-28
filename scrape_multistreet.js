@@ -175,17 +175,16 @@
   }
 
   async function stabilizeBackToTerminal(ftTerminalNode) {
-    // POST-TIER-9 FIX v9.4 (2026-05-24): per-click wait 700ms -> 2000ms.
-    // v9.12 added THIRD attempt with 5s wait. v9.20 added URL trace.
-    if (window.__msTraceLog) window.__msTraceLog('stabilize_entry_target_' + ftTerminalNode);
-    if (W.modalKind()) {
-      if (window.__msTraceLog) window.__msTraceLog('stabilize_closeModalX_at_entry');
-      await W.closeModalX();
-    }
-    if (W.urlNode() === ftTerminalNode) {
-      if (window.__msTraceLog) window.__msTraceLog('stabilize_already_at_target');
-      return true;
-    }
+    // POST-TIER-9 FIX v9.4 (2026-05-24): per-click wait 700ms -> 2000ms,
+    //   and if the URL doesn't change after a click, retry ONCE before
+    //   bailing. Tolerates slow VPN + React render lag during navigation.
+    // v9.12 (2026-05-25): added a THIRD attempt with 5s wait before bailing,
+    //   to tolerate deep terminals (4+ segments like C-R50-R75-C) where the
+    //   trainer's React re-render lags more than 2s. Also logs each retry to
+    //   result.events via window.__msProgress.stabilize_log so post-run
+    //   diagnostics can see which step failed.
+    if (W.modalKind()) await W.closeModalX();
+    if (W.urlNode() === ftTerminalNode) return true;
     const logEntry = (kind, detail) => {
       try {
         window.__msProgress.stabilize_log = window.__msProgress.stabilize_log || [];
@@ -198,31 +197,6 @@
     // accept that as "we arrived" -- the strict-equal check was too strict for
     // deep terminals where the trainer auto-positions URL one segment past.
     let bestSeen = W.urlNode();
-
-    // v9.19 (2026-05-26): v9.18 Phase B PRIMARY CLICK REVERTED.
-    //   The active click attempt didn't help on All-in collapse cases (turn
-    //   blocks gone post-collapse, blocks[ftbIdx] was OOB) and fell through
-    //   to heuristic loop anyway. The logEntry observations are kept as pure
-    //   DIAGNOSTIC so we can SEE whether the index points at a valid block
-    //   at stabilize entry. Real All-in recovery is the anchor click in
-    //   walker.dfsStreet (v9.19 Option 1) that fires BEFORE stabilize.
-    const ftbIdx = window.__msFirstTurnBlockIndex;
-    if (typeof ftbIdx === 'number' && ftbIdx >= 0) {
-      const blocks0 = W.readBlocks();
-      const firstTurnBlock = blocks0[ftbIdx];
-      if (firstTurnBlock && firstTurnBlock.headerEl) {
-        logEntry('first_turn_block_visible', {
-          ftbIdx, at: W.urlNode(), blocks_n: blocks0.length,
-          note: 'walker anchor click should have already run; if stabilize is needed, something else collapsed the view',
-        });
-      } else {
-        logEntry('first_turn_block_oob_or_collapsed', {
-          ftbIdx, blocks_n: blocks0.length, at: W.urlNode(),
-          modal: W.modalKind(), urlTurn: W.urlTurn(),
-        });
-      }
-    }
-
     let safety = 0;
     while (safety++ < 30) {
       // v9.13 (2026-05-25): close any auto-opened modal AT THE START OF EACH
@@ -328,10 +302,8 @@
         return false;
       }
       const before = W.urlNode();
-      if (window.__msTraceLog) window.__msTraceLog('pre_stabilize_click_player_' + (target.player || '?') + '_chosen_' + (target.actions.find(a => a.chosen)?.label || '?'));
       target.headerEl.click();
       await sleep(2000);
-      if (window.__msTraceLog) window.__msTraceLog('post_stabilize_click_attempt1');
       // Attempt 2: re-read blocks + click again (headerEl might be stale).
       if (W.urlNode() === before) {
         logEntry('attempt2_after_2s', { safety, before, still_at: W.urlNode() });
@@ -339,10 +311,8 @@
         let target2 = null;
         for (const b of blocks2) { if (b.actions.some(a => a.chosen)) target2 = b; }
         if (target2 && target2.headerEl) {
-          if (window.__msTraceLog) window.__msTraceLog('pre_stabilize_click_attempt2_player_' + (target2.player || '?'));
           target2.headerEl.click();
           await sleep(2000);
-          if (window.__msTraceLog) window.__msTraceLog('post_stabilize_click_attempt2');
         }
         // Attempt 3 (v9.12): one more re-read + 5s wait before giving up —
         //   this is the slow-VPN / deep-terminal escape hatch.
@@ -378,33 +348,6 @@
         if (W.modalKind() === 'turn') return { ok: true, path: 'cheap' };
       } catch (e) { /* fall through */ }
     }
-
-    // v9.19 (2026-05-26): v9.18 Phase C "fast path" REVERTED.
-    //   The recovery code was BYTE-IDENTICAL to the legacy replay path
-    //   (same replayFromFlopRoot + openModalByCloser, same /range/url cost).
-    //   KEPT: detection logEntry to count remaining All-in collapses (i.e.,
-    //   cases where the v9.19 walker-side anchor click did not prevent it).
-    try {
-      const lastClick = window.__msLastActionClicked;
-      const wasAllIn = lastClick && lastClick.code === 'A';
-      const wasTurnTerminal = ft.terminal_node && ft.terminal_node.includes('-');
-      const atFlopRoot = !W.urlTurn();
-      const noModal = !W.modalKind();
-      if (wasAllIn && wasTurnTerminal && atFlopRoot && noModal) {
-        try {
-          window.__msProgress.stabilize_log = window.__msProgress.stabilize_log || [];
-          window.__msProgress.stabilize_log.push({
-            t: Date.now(),
-            kind: 'allin_collapse_detected',
-            target: ft.terminal_node,
-            last_label: lastClick.label,
-            note: 'walker anchor click did not prevent trainer collapse; falling through to legacy replay',
-          });
-          if (window.__msProgress.stabilize_log.length > 200) window.__msProgress.stabilize_log.shift();
-        } catch (_) {}
-      }
-    } catch (_) { /* defensive */ }
-
     if (!await replayFromFlopRoot(ft.parent, walkResult)) return { ok: false, path: 'replay-failed' };
     if (!await openModalByCloser(ft.via)) return { ok: false, path: 'closer-failed' };
     return { ok: true, path: 'replay' };
@@ -554,7 +497,7 @@
       phase: 'starting', t_start: Date.now(),
       nodes_walked: 0, zips_emitted: 0,
       last_zip: null, last_node: null,
-      reopen_stats: { cheap: 0, replay: 0, 'allin-fast': 0, failed: 0 },
+      reopen_stats: { cheap: 0, replay: 0, failed: 0 },
       auto_continue: autoContinue,
       turn_cards_per_chunk: turnCardsPerChunk,
       node_wait_ms_range: [
@@ -1285,7 +1228,6 @@
           window.__msProgress.last_node = `${ft.terminal_node}/${commit.committed}/turn-walking`;
           const turnNodeStartIdx = result.nodes.length;
           log('walk_turn_start', { turn: commit.committed, terminal: ft.terminal_node });
-          if (window.__msTraceLog) window.__msTraceLog('pre_dfsStreet_turn_card_' + commit.committed);
           await W.dfsStreet({
             node: W.urlNode(), turn: commit.committed, river: null, suitMap: null, street: 'turn',
           }, result, {
@@ -1293,7 +1235,6 @@
               node._segment = { kind: 'turn_card', flop_terminal: ft.terminal_node, turn_card: commit.committed };
             },
           });
-          if (window.__msTraceLog) window.__msTraceLog('post_dfsStreet_turn_card_' + commit.committed);
           log('walk_turn_done', { turn: commit.committed });
           const turnNodes = result.nodes.slice(turnNodeStartIdx);
           turnCardNodes.push(...turnNodes);
@@ -1339,7 +1280,6 @@
               : `${ft.terminal_node}/${commit.committed}`;
 
             const turnNodesOnly = turnCardNodes.filter(n => n.street === 'turn');
-            if (window.__msTraceLog) window.__msTraceLog('pre_processSegment_turn');
             const tSeg = await processSegment('turn_node', turnNodesOnly, captures, result, chipsPerBb,
               { flop_terminal: ft.terminal_node, turn_card: commit.committed, dropFlopTerminalWrapper: dropWrapper });
             turnCardFiles.push(...tSeg.filesToZip);
@@ -1419,9 +1359,7 @@
             }
           }
 
-          if (window.__msTraceLog) window.__msTraceLog('pre_ensureTurnModalAtTerminal_after_card_' + commit.committed);
           const er = await ensureTurnModalAtTerminal();
-          if (window.__msTraceLog) window.__msTraceLog('post_ensureTurnModalAtTerminal_path_' + er.path);
           if (!er.ok) {
             result.warnings.push(`[${ft.terminal_node}] reopen modal after walking ${commit.committed} failed: ${er.path}`);
             window.__msProgress.reopen_stats.failed++;
@@ -1573,20 +1511,38 @@
             const pbChance = (humanCfg && typeof humanCfg.partial_browse_chance === 'number')
               ? humanCfg.partial_browse_chance : 0;
             if (pbChance > 0 && Math.random() < pbChance && typeof W.partialWalkOnTerminal === 'function') {
-              await W.partialWalkOnTerminal(ft.terminal_node, { excludeCards: explicitCards || [] });
-              // POST-TIER-9 v9.4 (2026-05-24): cleanup uses ensureTurnModalAtTerminal
-              //   which tries cheap (stabilize + reopenChipModal) FIRST and
-              //   only falls back to replay if cheap fails. Guarantees modal
-              //   is open afterwards so the real target walk doesn't fail
-              //   with "modal not open". Watch reopen_stats.replay -- if it
-              //   climbs, the cheap path needs more investigation.
-              try {
-                const _er = await ensureTurnModalAtTerminal();
-                if (!_er.ok) {
-                  result.warnings.push(`post-partial-walk cleanup at ${ft.terminal_node}: ${_er.path}`);
+              // v9.26 (2026-05-28): how many partials per card? Default [1,1] preserves
+              //   pre-v9.26 behavior. Stealth profile sets [1,2].
+              let _pwLo = 1, _pwHi = 1;
+              const _pwR = humanCfg && humanCfg.partial_walks_per_card_range;
+              if (Array.isArray(_pwR) && _pwR.length === 2 &&
+                  typeof _pwR[0] === 'number' && typeof _pwR[1] === 'number') {
+                _pwLo = Math.max(0, _pwR[0]|0);
+                _pwHi = Math.max(_pwLo, _pwR[1]|0);
+              }
+              const _pwN = _pwLo + Math.floor(Math.random() * (_pwHi - _pwLo + 1));
+              // v9.26: pass eligibility (workload's card_map.available + auto_aliased +
+              //   dim_dom for this terminal). The walker's hard-exclude is excludeCards
+              //   (full-run cards this session) UNIONed with auto_aliased + dim_dom.
+              const partialOpts = {
+                excludeCards: explicitCards || [],
+                eligibility: cfg.partial_walk_eligibility_per_terminal || null,
+              };
+              for (let _pw = 0; _pw < _pwN; _pw++) {
+                let _walked = 0;
+                try {
+                  _walked = await W.partialWalkOnTerminal(ft.terminal_node, partialOpts);
+                } catch (_) { _walked = 0; }
+                if (!_walked) break;  // pool exhausted; further loops will no-op
+                // Cleanup uses ensureTurnModalAtTerminal (cheap path first, replay fallback).
+                try {
+                  const _er = await ensureTurnModalAtTerminal();
+                  if (!_er.ok) {
+                    result.warnings.push(`post-partial-walk cleanup at ${ft.terminal_node} (pw#${_pw+1}): ${_er.path}`);
+                  }
+                } catch (e) {
+                  result.warnings.push(`post-partial-walk cleanup at ${ft.terminal_node} (pw#${_pw+1}): ${e.message}`);
                 }
-              } catch (e) {
-                result.warnings.push(`post-partial-walk cleanup at ${ft.terminal_node}: ${e.message}`);
               }
             }
           } catch (_) {}
@@ -2065,8 +2021,6 @@
       human_stats: Object.assign({}, window.__msHumanStats || {}, {
         node_wait_stats: window.__msNodeWaitStats || {},
       }),
-      // v9.20: persist URL trace for All-in collapse debugging
-      url_trace: (window.__msProgress && window.__msProgress.url_trace) ? window.__msProgress.url_trace.slice() : [],
       warnings: result.warnings || [],
       workloads_drawn_from: cfg.workloads_drawn_from || spec.workloads_drawn_from || [],
       session_kind: isProducerMode ? 'producer' : (spec.session_kind || 'scrape'),
@@ -2197,6 +2151,6 @@
     };
   }
 
-  return 'multi-street scraper installed (window.__scrapeMultiStreet, window.__scrapeSession) [v9.20 URL trace instrumentation; v9.19 All-in anchor click (walker-side, Option 1); v9.18 reverted (Phase B+C); v9.18 diagnostics kept: v9.17 true-quota-counter (n_range_url_calls per session); v9.14 chain-decomp diagnostic in no_chosen_block; v9.13 stabilize-iter-modal-close + diagnostics + url-prefix-match; v9.8 monotone-rule auto-alias (D/C aliased on monotone S/H boards); v9.11 producer-aware session_record (session_kind=producer for full-flop runs); v9.7.1 session-record-only emit, __msEmitResumeFile removed; v9.7 session-record-emit; tier 2/3 orch: categories-activate + partial-browse + shuffle_cards; tier-1 fixes: all-terminals-cached + per-card-manifest + modal-cleanup; phase 7 emergency-stop hook; phase 4 human-like noise wired (cfg.human_like -> window.__msHumanCfg + turn hover hook); phase 3 session wrapper; phase 2 card maps + target_cards_per_terminal; phase 1 session mode (zip_per_card + device_name + session_id); post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
+  return 'multi-street scraper installed (window.__scrapeMultiStreet, window.__scrapeSession) [v9.17 true-quota-counter (n_range_url_calls per session); v9.14 chain-decomp diagnostic in no_chosen_block; v9.13 stabilize-iter-modal-close + diagnostics + url-prefix-match; v9.8 monotone-rule auto-alias (D/C aliased on monotone S/H boards); v9.11 producer-aware session_record (session_kind=producer for full-flop runs); v9.7.1 session-record-only emit, __msEmitResumeFile removed; v9.7 session-record-emit; tier 2/3 orch: categories-activate + partial-browse + shuffle_cards; tier-1 fixes: all-terminals-cached + per-card-manifest + modal-cleanup; phase 7 emergency-stop hook; phase 4 human-like noise wired (cfg.human_like -> window.__msHumanCfg + turn hover hook); phase 3 session wrapper; phase 2 card maps + target_cards_per_terminal; phase 1 session mode (zip_per_card + device_name + session_id); post-v18 checkpoint-hygiene fix: fresh-launch state clear + flop emit order swap; v17 skip_flop_walk + cached_flop_terminals + chunk_max_raw_bytes + terminalFullyDone bug fix; v15 random 3-5s inter-node wait; 5-card chunk threshold; pause+checkpoint after every zip; v13 plomm envelope support; v11 dynamic bet sizings; v10 post-reload-resume options: skip_flop_zip + chunk_index_start_per_terminal]';
 })();
 
